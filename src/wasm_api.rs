@@ -14,6 +14,8 @@ pub(crate) use crate::document_core::helpers::*;
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
 
 use crate::model::document::{Document, Section};
 use crate::model::control::Control;
@@ -34,6 +36,15 @@ use crate::renderer::page_layout::PageLayoutInfo;
 use crate::renderer::DEFAULT_DPI;
 use crate::error::HwpError;
 use crate::document_core::{DocumentCore, DEFAULT_FALLBACK_FONT};
+
+static PARAGRAPH_STABLE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn generate_paragraph_stable_id() -> String {
+    // wasm 환경(브라우저)에서는 std::time이 지원되지 않아 패닉이 날 수 있으므로
+    // 단조 증가 시퀀스 기반 ID를 사용한다.
+    let seq = PARAGRAPH_STABLE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("sid_{seq:016x}")
+}
 
 impl From<HwpError> for JsValue {
     fn from(err: HwpError) -> Self {
@@ -157,6 +168,20 @@ impl HwpDocument {
         if self.respect_vpos_reset != enabled {
             self.respect_vpos_reset = enabled;
             // 모든 섹션 dirty 마킹 후 즉시 재페이지네이션
+            for d in self.core.dirty_sections.iter_mut() {
+                *d = true;
+            }
+            self.invalidate_page_tree_cache();
+            self.core.paginate();
+        }
+    }
+
+    /// 레거시 paginator 사용 여부를 설정한다.
+    /// TypesetEngine 호환 이슈 문서에서 레이아웃 안정화를 위해 fallback 경로를 강제한다.
+    #[wasm_bindgen(js_name = setUseLegacyPaginator)]
+    pub fn set_use_legacy_paginator(&mut self, enabled: bool) {
+        if self.use_legacy_paginator != enabled {
+            self.use_legacy_paginator = enabled;
             for d in self.core.dirty_sections.iter_mut() {
                 *d = true;
             }
@@ -314,6 +339,13 @@ impl HwpDocument {
     #[wasm_bindgen(js_name = setFallbackFont)]
     pub fn set_fallback_font(&mut self, path: &str) {
         self.fallback_font = path.to_string();
+    }
+
+    /// 현재 문서를 강제로 재조판한다.
+    /// 폰트 로딩 완료 직후/대형 도형 배치 변경 직후 호출해 페이지 밀림을 줄인다.
+    #[wasm_bindgen(js_name = refreshLayout)]
+    pub fn refresh_layout(&mut self) {
+        self.core.paginate();
     }
 
     /// 현재 대체 폰트 경로를 반환한다.
@@ -847,8 +879,11 @@ impl HwpDocument {
         para_idx: u32,
         char_offset: u32,
     ) -> Result<String, JsValue> {
-        self.split_paragraph_native(section_idx as usize, para_idx as usize, char_offset as usize)
-            .map_err(|e| e.into())
+        let out = self.split_paragraph_native(section_idx as usize, para_idx as usize, char_offset as usize)
+            .map_err(JsValue::from)?;
+        // split 후 새 문단은 새 ID를 가져야 한다.
+        self.ensure_paragraph_stable_ids();
+        Ok(out)
     }
 
     /// 강제 쪽 나누기 삽입 (Ctrl+Enter)
@@ -895,8 +930,11 @@ impl HwpDocument {
         section_idx: u32,
         para_idx: u32,
     ) -> Result<String, JsValue> {
-        self.merge_paragraph_native(section_idx as usize, para_idx as usize)
-            .map_err(|e| e.into())
+        let out = self.merge_paragraph_native(section_idx as usize, para_idx as usize)
+            .map_err(JsValue::from)?;
+        // merge 후 ID 중복/빈값 방지 정리.
+        self.ensure_paragraph_stable_ids();
+        Ok(out)
     }
 
     // ─── Phase 1: 기본 편집 보조 API ───────────────────────────
@@ -921,6 +959,77 @@ impl HwpDocument {
         self.get_paragraph_length_native(section_idx as usize, para_idx as usize)
             .map(|v| v as u32)
             .map_err(|e| e.into())
+    }
+
+    /// [이력관리 확장] 문단의 stable_id를 반환한다.
+    /// 원본 오픈소스 기본 API에는 없던 비교 추적성용 공개 경로.
+    ///
+    /// 목적:
+    /// - TS diff 엔진이 문단 정체성을 위치(section/paragraph index)가 아닌
+    ///   stable_id로 매칭할 수 있게 한다.
+    /// - 같은 문서의 시계열 비교에서 "수정/추가/삭제"를 더 정확히 분리한다.
+    #[wasm_bindgen(js_name = getParagraphStableId)]
+    pub fn get_paragraph_stable_id(&self, section_idx: u32, para_idx: u32) -> String {
+        let sec_i = section_idx as usize;
+        let para_i = para_idx as usize;
+        if let Some(sec) = self.document.sections.get(sec_i) {
+            if let Some(para) = sec.paragraphs.get(para_i) {
+                return para.stable_id.clone();
+            }
+        }
+        String::new()
+    }
+
+    /// [이력관리 확장] 문서 내 문단 stable_id 무결성 보정.
+    ///
+    /// 정책:
+    /// 1) 빈 ID만 발급 (기존 ID는 보존)
+    /// 2) 중복 ID는 신규 sid로 치환
+    ///
+    /// 기대효과:
+    /// - split/merge/copy-paste 이후에도 문서 내 sid 고유성 유지
+    /// - TS identity 비교(Map<sid>)가 실패하지 않도록 보장
+    #[wasm_bindgen(js_name = ensureParagraphStableIds)]
+    pub fn ensure_paragraph_stable_ids(&mut self) {
+        // 1) 빈 ID 채우기
+        for sec in &mut self.document.sections {
+            for para in &mut sec.paragraphs {
+                if para.stable_id.is_empty() {
+                    para.stable_id = generate_paragraph_stable_id();
+                }
+            }
+        }
+        // 2) 중복 ID 정리 (복붙 등으로 동일 ID가 복제된 경우)
+        let mut seen: HashSet<String> = HashSet::new();
+        for sec in &mut self.document.sections {
+            for para in &mut sec.paragraphs {
+                if seen.contains(&para.stable_id) {
+                    para.stable_id = generate_paragraph_stable_id();
+                }
+                seen.insert(para.stable_id.clone());
+            }
+        }
+    }
+
+    /// [이력관리 확장] 디버그: 문단 stable_id 일부를 JSON 배열로 반환한다.
+    ///
+    /// 사용처:
+    /// - 프론트 콘솔에서 sid 분포/중복/빈값 여부를 빠르게 확인
+    /// - "왜 alignment로 폴백됐는지" 원인 추적 시 진단 도구로 사용
+    #[wasm_bindgen(js_name = debugDumpStableIds)]
+    pub fn debug_dump_stable_ids(&self, section_idx: u32, start_para: u32, count: u32) -> String {
+        let sec_i = section_idx as usize;
+        let start = start_para as usize;
+        let end = start.saturating_add(count as usize);
+        let Some(sec) = self.document.sections.get(sec_i) else {
+            return "[]".to_string();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for pi in start..end.min(sec.paragraphs.len()) {
+            let id = sec.paragraphs[pi].stable_id.clone();
+            out.push(format!("{{\"sec\":{},\"para\":{},\"id\":\"{}\"}}", sec_i, pi, id));
+        }
+        format!("[{}]", out.join(","))
     }
 
     /// 문단에 텍스트박스가 있는 Shape 컨트롤이 있으면 해당 control_index를 반환한다.
@@ -1506,6 +1615,58 @@ impl HwpDocument {
         ).map_err(|e| e.into())
     }
 
+    /// 표의 구조/속성/셀 텍스트를 포함한 비교용 시그니처를 반환한다.
+    ///
+    /// 반환: JSON
+    /// `{"rowCount":..,"colCount":..,"cellCount":..,"props":"..","cells":[..]}`
+    #[wasm_bindgen(js_name = getTableSignature)]
+    pub fn get_table_signature(
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+    ) -> Result<String, JsValue> {
+        let sec = self.document.sections.get(section_idx as usize)
+            .ok_or_else(|| JsValue::from_str("구역 인덱스 범위 초과"))?;
+        let para = sec.paragraphs.get(parent_para_idx as usize)
+            .ok_or_else(|| JsValue::from_str("문단 인덱스 범위 초과"))?;
+        let table = match para.controls.get(control_idx as usize) {
+            Some(Control::Table(t)) => t,
+            _ => return Err(JsValue::from_str("해당 control_idx가 표가 아닙니다")),
+        };
+
+        let mut cells_json: Vec<String> = Vec::with_capacity(table.cells.len());
+        for cell in &table.cells {
+            let mut paras_json: Vec<String> = Vec::with_capacity(cell.paragraphs.len());
+            for p in &cell.paragraphs {
+                let t = p.text.replace('\u{000d}', "");
+                paras_json.push(format!("\"{}\"", json_escape(&t)));
+            }
+            cells_json.push(format!(
+                "{{\"row\":{},\"col\":{},\"rowSpan\":{},\"colSpan\":{},\"textDirection\":{},\"paras\":[{}]}}",
+                cell.row,
+                cell.col,
+                cell.row_span,
+                cell.col_span,
+                cell.text_direction as u32,
+                paras_json.join(",")
+            ));
+        }
+
+        let props = self.get_table_properties_native(
+            section_idx as usize, parent_para_idx as usize, control_idx as usize,
+        ).unwrap_or_else(|_| "{}".to_string());
+
+        Ok(format!(
+            "{{\"rowCount\":{},\"colCount\":{},\"cellCount\":{},\"props\":{},\"cells\":[{}]}}",
+            table.row_count,
+            table.col_count,
+            table.cells.len(),
+            props,
+            cells_json.join(",")
+        ))
+    }
+
     /// 표 속성을 수정한다.
     ///
     /// 반환: JSON `{"ok":true}`
@@ -1848,6 +2009,58 @@ impl HwpDocument {
         self.get_shape_properties_native(
             section_idx as usize, parent_para_idx as usize, control_idx as usize,
         ).map_err(|e| e.into())
+    }
+
+    /// Shape(글상자) 내부 텍스트를 반환한다.
+    ///
+    /// 반환: JSON `{"ok":true,"text":"..."}` 또는 `{"ok":false,"text":""}`
+    #[wasm_bindgen(js_name = getShapeText)]
+    pub fn get_shape_text(
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+    ) -> String {
+        fn collect_paragraph_text(paras: &[crate::model::paragraph::Paragraph], out: &mut Vec<String>) {
+            for p in paras {
+                let t = p.text.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+            }
+        }
+
+        fn collect_shape_text(shape: &crate::model::shape::ShapeObject, out: &mut Vec<String>) {
+            if let Some(tb) = shape.drawing().and_then(|d| d.text_box.as_ref()) {
+                collect_paragraph_text(&tb.paragraphs, out);
+            }
+            if let crate::model::shape::ShapeObject::Group(g) = shape {
+                if let Some(cap) = g.caption.as_ref() {
+                    collect_paragraph_text(&cap.paragraphs, out);
+                }
+                for child in &g.children {
+                    collect_shape_text(child, out);
+                }
+            }
+        }
+
+        let sec = section_idx as usize;
+        let ppi = parent_para_idx as usize;
+        let ci = control_idx as usize;
+        let Some(section) = self.document.sections.get(sec) else {
+            return r#"{"ok":false,"text":""}"#.to_string();
+        };
+        let Some(para) = section.paragraphs.get(ppi) else {
+            return r#"{"ok":false,"text":""}"#.to_string();
+        };
+        let Some(Control::Shape(shape)) = para.controls.get(ci) else {
+            return r#"{"ok":false,"text":""}"#.to_string();
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        collect_shape_text(shape, &mut lines);
+        let text = lines.join("\n");
+        format!(r#"{{"ok":true,"text":"{}"}}"#, json_escape(&text))
     }
 
     /// Shape(글상자) 속성을 변경한다.

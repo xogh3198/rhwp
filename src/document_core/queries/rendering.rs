@@ -105,12 +105,14 @@ impl DocumentCore {
             .join(",");
         Ok(format!(
             "{{\"pageIndex\":{},\"width\":{:.1},\"height\":{:.1},\"sectionIndex\":{},\
+            \"pageNumber\":{},\
             \"marginLeft\":{:.1},\"marginRight\":{:.1},\"marginTop\":{:.1},\"marginBottom\":{:.1},\
             \"marginHeader\":{:.1},\"marginFooter\":{:.1},\"columns\":[{}]}}",
             page_content.page_index,
             page_content.layout.page_width,
             page_content.layout.page_height,
             page_content.section_index,
+            page_content.page_number,
             ml, mr, mt, mb, mh, mf,
             cols_json,
         ))
@@ -821,8 +823,10 @@ impl DocumentCore {
             };
 
             let column_def = Self::find_initial_column_def(&section.paragraphs);
-            // TypesetEngine을 main pagination으로 사용. RHWP_USE_PAGINATOR=1 로 fallback 가능.
-            let use_paginator = std::env::var("RHWP_USE_PAGINATOR").map(|v| v == "1").unwrap_or(false);
+            // TypesetEngine을 main pagination으로 사용.
+            // 문서별 호환 이슈가 있을 때는 use_legacy_paginator 또는 env 플래그로 fallback 가능.
+            let use_paginator = self.use_legacy_paginator
+                || std::env::var("RHWP_USE_PAGINATOR").map(|v| v == "1").unwrap_or(false);
             let mut result = if use_paginator {
                 paginator.paginate_with_measured_opts(
                     &section.paragraphs,

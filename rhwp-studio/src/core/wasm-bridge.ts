@@ -1,3 +1,24 @@
+/**
+ * 원본 오픈소스 대비 브리지 확장 (상세)
+ *
+ * [역할]
+ * - TS UI/엔진 레이어와 Rust WASM API 사이의 계약면.
+ * - 비교/이력 기능이 요구하는 "문서 구조 조회 + sid 무결성 + 조판 동기화"를 담당한다.
+ *
+ * [비교/이력용으로 추가된 성격의 API]
+ * - 문서/레이아웃 조회: `getDocumentInfo`, `getPageInfo`, `getSectionDef`
+ * - sid 계열: `getParagraphStableId`, `ensureParagraphStableIds`, `debugDumpStableIds`
+ * - 개체 비교 보조: `getTableSignature` 등
+ * - 조판 안정화: `refreshLayout`
+ *
+ * [중요 제약]
+ * - `ensureParagraphStableIds`는 WASM aliasing 예외가 날 수 있어 try/catch로 보호한다.
+ * - 호출 시점은 "문서 편집 중 상시"가 아니라 "스냅샷/비교 직전 또는 안전 구간"이 원칙이다.
+ *
+ * [유지보수 포인트]
+ * - 이 파일에 API를 추가할 때는 반드시 Rust `wasm_api.rs` export와 짝을 맞춰야 한다.
+ * - 브리지 시그니처와 `src/core/types.ts` 타입이 어긋나면 비교/탐색 품질 저하가 즉시 발생한다.
+ */
 import init, { HwpDocument, version } from '@wasm/rhwp.js';
 import type { DocumentInfo, PageInfo, PageDef, SectionDef, CursorRect, HitTestResult, LineInfo, TableDimensions, CellInfo, CellBbox, CellProperties, TableProperties, DocumentPosition, MoveVerticalResult, SelectionRect, CharProperties, ParaProperties, CellPathEntry, NavContextEntry, FieldInfoResult, BookmarkInfo } from './types';
 
@@ -39,7 +60,11 @@ function substituteCssFontFamily(cssFont: string): string {
   if (REGISTERED_FONTS.has(fontName)) return cssFont;
 
   const resolved = resolveFont(fontName, 0, 0);
-  if (resolved === fontName) return cssFont;
+  // 치환 테이블에서 해소하지 못한 폰트명은 브라우저 기본 fallback에 맡기지 않고
+  // 고정 fallback 체인으로 정규화해 줄폭 흔들림을 줄인다.
+  if (resolved === fontName) {
+    return prefix + fontFamilyWithFallback(fontName);
+  }
 
   return prefix + fontFamilyWithFallback(resolved);
 }
@@ -84,10 +109,17 @@ export class WasmBridge {
     this._currentFileHandle = null;
     this.doc = new HwpDocument(data);
     this.doc.convertToEditable();
+    // 문서 로드 직후 한 번만 안정 ID 보정 (스냅샷 시점 &mut 호출 회피)
+    this.ensureParagraphStableIds();
     this.doc.setFileName(this._fileName);
     const info: DocumentInfo = JSON.parse(this.doc.getDocumentInfo());
     console.log(`[WasmBridge] 문서 로드: ${info.pageCount}페이지`);
     return info;
+  }
+
+  /** 메인 뷰에 문서가 올라와 있는지(비교 다이얼로그 전용 브리지와 구분). */
+  hasLoadedDocument(): boolean {
+    return this.doc != null;
   }
 
   createNewDocument(): DocumentInfo {
@@ -96,6 +128,8 @@ export class WasmBridge {
       this.doc = HwpDocument.createEmpty();
     }
     const info: DocumentInfo = JSON.parse(this.doc.createBlankDocument());
+    // 새 문서 초기 문단들에 stable_id 선할당
+    this.ensureParagraphStableIds();
     this._fileName = '새 문서.hwp';
     this._currentFileHandle = null;
     this.doc.setFileName(this._fileName);
@@ -155,8 +189,46 @@ export class WasmBridge {
     return (this.doc as any).reflowLinesegs?.() ?? 0;
   }
 
+  /** 강제 재조판: 폰트/도형 반영 후 페이지 위치를 안정화한다. */
+  refreshLayout(): void {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    try {
+      (this.doc as any).refreshLayout?.();
+    } catch (e) {
+      console.warn('[WasmBridge] refreshLayout failed:', e);
+    }
+  }
+
+  /** vpos reset 경계를 페이지네이션 강제 분리로 처리한다(구형 HWP 레이아웃 흔들림 완화). */
+  setRespectVposReset(enabled: boolean): void {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    try {
+      const d = this.doc as unknown as { setRespectVposReset?: (v: boolean) => void };
+      d.setRespectVposReset?.(enabled);
+    } catch (e) {
+      console.warn('[WasmBridge] setRespectVposReset skipped:', e);
+    }
+  }
+
+  /** TypesetEngine 호환 이슈 문서에서 레거시 paginator를 강제한다. */
+  setUseLegacyPaginator(enabled: boolean): void {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    try {
+      const d = this.doc as unknown as { setUseLegacyPaginator?: (v: boolean) => void };
+      d.setUseLegacyPaginator?.(enabled);
+    } catch (e) {
+      console.warn('[WasmBridge] setUseLegacyPaginator skipped:', e);
+    }
+  }
+
   get pageCount(): number {
     return this.doc?.pageCount() ?? 0;
+  }
+
+  /** 현재 로드된 문서의 구역/쪽 수 등 (비교·이력 스냅샷용) */
+  getDocumentInfo(): DocumentInfo {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(this.doc.getDocumentInfo());
   }
 
   getPageInfo(pageNum: number): PageInfo {
@@ -262,6 +334,37 @@ export class WasmBridge {
   getParagraphLength(sec: number, para: number): number {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return this.doc.getParagraphLength(sec, para);
+  }
+
+  /** IR 문단 `stable_id` (Rust/WASM). 비교 Map 키로 사용. */
+  getParagraphStableId(sec: number, para: number): string {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    const d = this.doc as unknown as { getParagraphStableId?: (a: number, b: number) => string };
+    if (typeof d.getParagraphStableId !== 'function') return '';
+    return d.getParagraphStableId(sec, para) ?? '';
+  }
+
+  /** 비교/이력 스냅샷 생성 시점에만 stable_id를 보정한다(문서 로드 시 자동 호출 금지). */
+  ensureParagraphStableIds(): void {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    const d = this.doc as unknown as { ensureParagraphStableIds?: () => void };
+    if (typeof d.ensureParagraphStableIds === 'function') {
+      try {
+        d.ensureParagraphStableIds();
+      } catch (e) {
+        // 라이브 렌더/스케줄러와 겹칠 때 wasm-bindgen aliasing 예외가 날 수 있다.
+        // 이 경우 getParagraphStableId()의 fallback id 경로로 계속 진행한다.
+        console.warn('[WasmBridge] ensureParagraphStableIds skipped:', e);
+      }
+    }
+  }
+
+  /** 디버그: `JSON.parse(bridge.debugDumpStableIds(0,0,12))` — 분할 직후 ① stable_id 확인 */
+  debugDumpStableIds(sec: number, startPara: number, count: number): string {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    const d = this.doc as unknown as { debugDumpStableIds?: (a: number, b: number, c: number) => string };
+    if (typeof d.debugDumpStableIds !== 'function') return '[]';
+    return d.debugDumpStableIds(sec, startPara, count) ?? '[]';
   }
 
   getParagraphCount(sec: number): number {
@@ -458,6 +561,15 @@ export class WasmBridge {
     return JSON.parse(this.doc.getTableProperties(sec, parentPara, controlIdx));
   }
 
+  getTableSignature(sec: number, parentPara: number, controlIdx: number): string {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    const d = this.doc as unknown as { getTableSignature?: (a: number, b: number, c: number) => string };
+    if (typeof d.getTableSignature !== 'function') {
+      throw new Error('getTableSignature API unavailable');
+    }
+    return d.getTableSignature(sec, parentPara, controlIdx);
+  }
+
   setTableProperties(sec: number, parentPara: number, controlIdx: number, props: Partial<TableProperties>): { ok: boolean } {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return JSON.parse(this.doc.setTableProperties(sec, parentPara, controlIdx, JSON.stringify(props)));
@@ -578,6 +690,11 @@ export class WasmBridge {
   getShapeProperties(sec: number, para: number, ci: number): import('./types').ShapeProperties {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return JSON.parse(this.doc.getShapeProperties(sec, para, ci));
+  }
+
+  getShapeText(sec: number, para: number, ci: number): { ok: boolean; text: string } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse((this.doc as any).getShapeText(sec, para, ci));
   }
 
   setShapeProperties(sec: number, para: number, ci: number, props: Record<string, unknown>): { ok: boolean } {

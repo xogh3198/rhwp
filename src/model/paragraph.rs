@@ -5,6 +5,8 @@ use super::control::Control;
 /// 문단 (HWPTAG_PARA_HEADER + 하위 레코드)
 #[derive(Debug, Default, Clone)]
 pub struct Paragraph {
+    /// 비교/이력 추적용 영속 stable ID (세션 내 유지)
+    pub stable_id: String,
     /// 문자 수 (제어 문자 포함)
     pub char_count: u32,
     /// 컨트롤 마스크
@@ -188,6 +190,7 @@ impl Paragraph {
     /// 표 셀 생성 등에서 최소한의 유효한 문단이 필요할 때 사용한다.
     pub fn new_empty() -> Self {
         Paragraph {
+            stable_id: String::new(),
             char_count: 1, // 끝 마커(0x000D) 포함
             line_segs: vec![LineSeg {
                 text_start: 0,
@@ -573,6 +576,7 @@ impl Paragraph {
         let new_has_para_text = !new_text.is_empty(); // 새 문단은 controls가 없으므로 텍스트 유무로 판단
 
         Paragraph {
+            stable_id: String::new(),
             text: new_text,
             char_offsets: new_char_offsets,
             char_shapes: new_char_shapes,

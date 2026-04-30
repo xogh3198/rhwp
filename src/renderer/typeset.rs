@@ -491,7 +491,8 @@ impl TypesetEngine {
 
             if !has_table {
                 // --- 핵심: format → fits → place/split ---
-                let formatted = self.format_paragraph(para, composed.get(para_idx), styles);
+                let mut formatted = self.format_paragraph(para, composed.get(para_idx), styles);
+                self.normalize_floating_only_paragraph_height(para, &mut formatted);
                 self.typeset_paragraph(&mut st, para_idx, para, &formatted);
             } else {
                 // 표 문단: Phase 2에서 전환 예정. 현재는 기존 방식 호환용 stub.
@@ -659,6 +660,67 @@ impl TypesetEngine {
             spacing_before,
             spacing_after,
             height_for_fit,
+        }
+    }
+
+    /// 비-TAC 부유 도형(글앞/글뒤/어울림)만 있는 빈 문단의 과대 높이를 완화한다.
+    ///
+    /// 일부 문서에서 lineSeg 높이가 과하게 남아 페이지가 한 장 더 늘어나는 현상을 막기 위한 방어 보정.
+    /// 도형 자체 위치는 PageItem::Shape/레이아웃 단계에서 처리되므로 본문 흐름 높이는 최소화한다.
+    fn normalize_floating_only_paragraph_height(&self, para: &Paragraph, fmt: &mut FormattedParagraph) {
+        let is_blank_text = para.text.trim().is_empty();
+        if !is_blank_text {
+            return;
+        }
+        let has_non_tac_floating = para.controls.iter().any(|ctrl| {
+            use crate::model::shape::TextWrap;
+            match ctrl {
+                Control::Picture(pic) => {
+                    !pic.common.treat_as_char
+                        && matches!(
+                            pic.common.text_wrap,
+                            TextWrap::Square
+                                | TextWrap::TopAndBottom
+                                | TextWrap::InFrontOfText
+                                | TextWrap::BehindText
+                        )
+                }
+                Control::Shape(shape) => {
+                    let c = shape.common();
+                    !c.treat_as_char
+                        && matches!(
+                            c.text_wrap,
+                            TextWrap::Square
+                                | TextWrap::TopAndBottom
+                                | TextWrap::InFrontOfText
+                                | TextWrap::BehindText
+                        )
+                }
+                Control::Table(t) => {
+                    !t.common.treat_as_char
+                        && matches!(
+                            t.common.text_wrap,
+                            TextWrap::Square
+                                | TextWrap::TopAndBottom
+                                | TextWrap::InFrontOfText
+                                | TextWrap::BehindText
+                        )
+                }
+                _ => false,
+            }
+        });
+        if !has_non_tac_floating {
+            return;
+        }
+
+        let base = fmt.spacing_before + fmt.spacing_after;
+        fmt.total_height = base.max(0.0);
+        fmt.height_for_fit = fmt.total_height;
+        for lh in &mut fmt.line_heights {
+            *lh = 0.0;
+        }
+        for ls in &mut fmt.line_spacings {
+            *ls = 0.0;
         }
     }
 

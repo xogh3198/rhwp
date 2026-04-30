@@ -191,6 +191,21 @@ const _substMaps = SUBST_TABLES.map(langTable => {
 
 // 해소 결과 캐시
 const _resolveCache = new Map<string, string>();
+const _localFontCheckCache = new Map<string, boolean>();
+
+function isLocallyInstalledFont(fontName: string): boolean {
+  if (!fontName) return false;
+  const cached = _localFontCheckCache.get(fontName);
+  if (cached !== undefined) return cached;
+  let ok = false;
+  try {
+    ok = document.fonts.check(`12px "${fontName}"`);
+  } catch {
+    ok = false;
+  }
+  _localFontCheckCache.set(fontName, ok);
+  return ok;
+}
 
 /**
  * 폰트 이름을 웹에서 렌더링 가능한 폰트로 치환한다.
@@ -202,6 +217,9 @@ const _resolveCache = new Map<string, string>();
  */
 export function resolveFont(fontName: string, altType: number, langId: number): string {
   if (!fontName) return fontName;
+  // OS/로컬에 원본 폰트가 있으면 치환하지 않고 그대로 사용한다.
+  // 조판 정확도(줄바꿈/개체 위치)를 위해 가장 보수적인 선택.
+  if (isLocallyInstalledFont(fontName)) return fontName;
   if (REGISTERED_FONTS.has(fontName)) return fontName;
 
   const cacheKey = langId + '\0' + fontName + '\0' + altType;

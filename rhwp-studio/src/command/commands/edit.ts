@@ -2,9 +2,26 @@ import type { CommandDef } from '../types';
 import { FieldEditDialog } from '@/ui/field-edit-dialog';
 import { FindDialog } from '@/ui/find-dialog';
 import { GotoDialog } from '@/ui/goto-dialog';
+import { HistoryDialog } from '@/ui/history-dialog';
+import { CompareDialog } from '@/ui/compare-dialog';
+import { CompareSessionStore } from '@/compare/session';
 
 /** 검색 대화상자 싱글톤 — 열려 있으면 재사용 */
 let findDialogInstance: FindDialog | null = null;
+/**
+ * 원본 대비 확장: 문서 이력 관리 다이얼로그 싱글톤
+ * - 다이얼로그 중복 생성 방지
+ * - 같은 세션에서 열기/닫기 반복 시 상태와 스크롤 UX를 안정적으로 유지
+ */
+let historyDialogInstance: HistoryDialog | null = null;
+/** 원본 대비 확장: 2파일 문서 비교 다이얼로그 싱글톤 */
+let compareDialogInstance: CompareDialog | null = null;
+/**
+ * 원본 대비 확장: 비교/이력 공용 세션 스토어
+ * - diff 결과를 단일 스토어로 모아 `compare:navigate-diff` 체인을 재사용한다.
+ * - 이력관리와 향후 2파일 문서비교 UI가 같은 이동/하이라이트 경로를 공유하기 위한 기반.
+ */
+let compareSessionStore: CompareSessionStore | null = null;
 
 export const editCommands: CommandDef[] = [
   {
@@ -149,6 +166,38 @@ export const editCommands: CommandDef[] = [
           (ih as any).updateCaret?.();
         }
       }
+    },
+  },
+  {
+    id: 'edit:compare-documents',
+    label: '문서 비교',
+    shortcutLabel: 'Alt+Shift+V',
+    canExecute: () => true,
+    execute(services) {
+      if (!compareSessionStore) {
+        compareSessionStore = new CompareSessionStore(services.eventBus);
+      }
+      if (historyDialogInstance?.isOpen()) historyDialogInstance.hide();
+      if (compareDialogInstance && compareDialogInstance.isOpen()) return;
+      compareDialogInstance = new CompareDialog(services, compareSessionStore);
+      compareDialogInstance.show();
+    },
+  },
+  {
+    id: 'edit:document-history',
+    label: '문서 이력 관리',
+    shortcutLabel: 'Ctrl+Shift+H',
+    canExecute: () => true,
+    execute(services) {
+      if (!compareSessionStore) {
+        compareSessionStore = new CompareSessionStore(services.eventBus);
+      }
+      if (compareDialogInstance?.isOpen()) compareDialogInstance.hide();
+      if (historyDialogInstance && historyDialogInstance.isOpen()) {
+        return;
+      }
+      historyDialogInstance = new HistoryDialog(services, compareSessionStore);
+      historyDialogInstance.show();
     },
   },
   {

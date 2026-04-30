@@ -5,7 +5,8 @@ import { CanvasView } from '@/view/canvas-view';
 import { InputHandler } from '@/engine/input-handler';
 import { Toolbar } from '@/ui/toolbar';
 import { MenuBar } from '@/ui/menu-bar';
-import { loadWebFonts } from '@/core/font-loader';
+import { getDetectedOSFonts, loadWebFonts, REGISTERED_FONTS } from '@/core/font-loader';
+import { resolveFont } from '@/core/font-substitution';
 import { CommandRegistry } from '@/command/registry';
 import { CommandDispatcher } from '@/command/dispatcher';
 import type { EditorContext, CommandServices } from '@/command/types';
@@ -19,7 +20,6 @@ import { pageCommands } from '@/command/commands/page';
 import { toolCommands } from '@/command/commands/tool';
 import { ContextMenu } from '@/ui/context-menu';
 import { CommandPalette } from '@/ui/command-palette';
-import { showValidationModalIfNeeded } from '@/ui/validation-modal';
 import { showToast } from '@/ui/toast';
 import { CellSelectionRenderer } from '@/engine/cell-selection-renderer';
 import { TableObjectRenderer } from '@/engine/table-object-renderer';
@@ -87,6 +87,36 @@ const sbMessage = () => document.getElementById('sb-message')!;
 const sbPage = () => document.getElementById('sb-page')!;
 const sbSection = () => document.getElementById('sb-section')!;
 const sbZoomVal = () => document.getElementById('sb-zoom-val')!;
+
+function debugFontResolution(docInfo: DocumentInfo): void {
+  const used = [...new Set(docInfo.fontsUsed ?? [])].filter(Boolean);
+  if (used.length === 0) return;
+  const rows = used.map((name) => {
+    const resolved = resolveFont(name, 0, 0);
+    let localInstalled = false;
+    try {
+      localInstalled = document.fonts.check(`16px "${name}"`);
+    } catch {
+      localInstalled = false;
+    }
+    return {
+      source: name,
+      resolved,
+      localInstalled,
+      registeredSource: REGISTERED_FONTS.has(name),
+      registeredResolved: REGISTERED_FONTS.has(resolved),
+      changed: resolved !== name,
+    };
+  });
+  const unresolved = rows.filter((r) => !r.localInstalled && !r.registeredSource && !r.registeredResolved);
+  console.groupCollapsed(`[font-debug] used=${rows.length}, unresolved=${unresolved.length}`);
+  console.log('[font-debug] detectedOSFonts=', Array.from(getDetectedOSFonts()));
+  console.table(rows);
+  if (unresolved.length > 0) {
+    console.warn('[font-debug] unresolved fonts:', unresolved.map((r) => r.source));
+  }
+  console.groupEnd();
+}
 
 async function initialize(): Promise<void> {
   const msg = sbMessage();
@@ -324,11 +354,63 @@ function setupZoomControls(): void {
 }
 
 let totalSections = 1;
+let sectionPageCache: {
+  pageCount: number;
+  localPageByIndex: number[];
+  totalPagesByIndex: number[];
+} | null = null;
+
+function ensureSectionPageCache(): void {
+  const pageCount = wasm.pageCount;
+  if (pageCount <= 0) {
+    sectionPageCache = null;
+    return;
+  }
+  if (sectionPageCache && sectionPageCache.pageCount === pageCount) return;
+
+  const sectionByPage: number[] = [];
+  for (let i = 0; i < pageCount; i += 1) {
+    sectionByPage.push(wasm.getPageInfo(i).sectionIndex);
+  }
+
+  const localPageByIndex = new Array<number>(pageCount).fill(1);
+  const totalPagesByIndex = new Array<number>(pageCount).fill(1);
+
+  let runStart = 0;
+  while (runStart < pageCount) {
+    const sectionIndex = sectionByPage[runStart];
+    let runEnd = runStart + 1;
+    while (runEnd < pageCount && sectionByPage[runEnd] === sectionIndex) {
+      runEnd += 1;
+    }
+    const runTotal = runEnd - runStart;
+    for (let i = runStart; i < runEnd; i += 1) {
+      localPageByIndex[i] = (i - runStart) + 1;
+      totalPagesByIndex[i] = runTotal;
+    }
+    runStart = runEnd;
+  }
+
+  sectionPageCache = { pageCount, localPageByIndex, totalPagesByIndex };
+}
 
 function setupEventListeners(): void {
   eventBus.on('current-page-changed', (page, _total) => {
     const pageIdx = page as number;
-    sbPage().textContent = `${pageIdx + 1} / ${_total} 쪽`;
+    try {
+      const pageInfo = wasm.getPageInfo(pageIdx);
+      const sectionPageNum = pageInfo.pageNumber;
+      if (typeof sectionPageNum === 'number' && Number.isFinite(sectionPageNum) && sectionPageNum > 0) {
+        sbPage().textContent = `쪽: ${sectionPageNum}`;
+      } else {
+        ensureSectionPageCache();
+        const local = sectionPageCache?.localPageByIndex[pageIdx] ?? (pageIdx + 1);
+        const sectionTotal = sectionPageCache?.totalPagesByIndex[pageIdx] ?? _total;
+        sbPage().textContent = `쪽: ${local} / ${sectionTotal}`;
+      }
+    } catch {
+      sbPage().textContent = `${pageIdx + 1} / ${_total} 쪽`;
+    }
 
     // 구역 정보: 현재 페이지의 sectionIndex로 갱신
     if (wasm.pageCount > 0) {
@@ -400,19 +482,88 @@ function setupEventListeners(): void {
       }
     }
   });
+
+  // 문서 비교/이력관리 결과 탐색: 선택한 차이의 문단 위치로 커서/뷰를 이동한다.
+  eventBus.on('compare:navigate-diff', (payload) => {
+    if (!inputHandler) return;
+    if (!wasm.hasLoadedDocument()) return;
+    try {
+      const item = payload as {
+        severity?: 'added' | 'removed' | 'modified';
+        path?: { section?: number; paragraph?: number };
+        leftAnchor?: { pageIndex: number; x: number; y: number; width: number; height: number };
+        rightAnchor?: { pageIndex: number; x: number; y: number; width: number; height: number };
+      };
+
+      // 현재 문서(오른쪽) 기준 탐색: rightAnchor 우선, 없으면 leftAnchor 사용.
+      // 렌더 결과 좌표를 hitTest로 다시 문단 위치로 역매핑하면 "한 칸 밀림"을 크게 줄일 수 있다.
+      const preferredAnchor = item.rightAnchor ?? item.leftAnchor;
+      if (preferredAnchor) {
+        const padX = Math.max(2, Math.floor(preferredAnchor.width * 0.15));
+        const padY = Math.max(2, Math.floor(preferredAnchor.height * 0.35));
+        const hit = wasm.hitTest(
+          preferredAnchor.pageIndex,
+          preferredAnchor.x + padX,
+          preferredAnchor.y + padY,
+        );
+        if (hit && hit.sectionIndex >= 0 && hit.paragraphIndex >= 0) {
+          inputHandler.moveCursorTo({
+            sectionIndex: hit.sectionIndex,
+            paragraphIndex: hit.paragraphIndex,
+            charOffset: Math.max(0, hit.charOffset ?? 0),
+          });
+          (inputHandler as any).updateCaret?.();
+          return;
+        }
+      }
+
+      const section = item.path?.section;
+      const paragraph = item.path?.paragraph;
+      if (section == null || paragraph == null) return;
+      inputHandler.moveCursorTo({
+        sectionIndex: section,
+        paragraphIndex: paragraph,
+        charOffset: 0,
+      });
+      (inputHandler as any).updateCaret?.();
+    } catch {
+      // 비교 대상이 현재 문서 범위를 벗어나면 무시
+    }
+  });
 }
 
 /** 문서 초기화 공통 시퀀스 (loadFile, createNewDocument 양쪽에서 사용) */
-async function initializeDocument(docInfo: DocumentInfo, displayName: string): Promise<void> {
+async function initializeDocument(
+  docInfo: DocumentInfo,
+  displayName: string,
+): Promise<{ warningCount: number; reflowedCount: number }> {
+  sectionPageCache = null;
   const msg = sbMessage();
+  let warningCount = 0;
+  let reflowedCount = 0;
   try {
+    debugFontResolution(docInfo);
     console.log('[initDoc] 1. 폰트 로딩 시작');
+    let fontReport:
+      | {
+          loaded: number;
+          failed: number;
+          total: number;
+          missingCriticalFonts: string[];
+        }
+      | undefined;
     if (docInfo.fontsUsed?.length) {
-      await loadWebFonts(docInfo.fontsUsed, (loaded, total) => {
+      fontReport = await loadWebFonts(docInfo.fontsUsed, (loaded, total) => {
         msg.textContent = `폰트 로딩 중... (${loaded}/${total})`;
       });
     }
     console.log('[initDoc] 2. 폰트 로딩 완료');
+    // 폰트 로딩 완료 직후 조판을 재실행해 개체(표/그림/도형)의 페이지 이동 오차를 줄인다.
+    try {
+      wasm.refreshLayout();
+    } catch (e) {
+      console.warn('[initDoc] refreshLayout(초기) 실패:', e);
+    }
     msg.textContent = displayName;
     totalSections = docInfo.sectionCount ?? 1;
     sbSection().textContent = `구역: 1 / ${totalSections}`;
@@ -428,20 +579,40 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
     inputHandler?.activateWithCaretPosition();
     console.log('[initDoc] 8. 완료');
 
-    // #177: HWPX 비표준 lineseg 감지 → 경고 있으면 모달로 사용자 선택 요청
+    // FontFace 등록이 비동기로 안정화되는 동안 한 번 더 재조판/재렌더링해
+    // 로드 직후 "다음 페이지로 밀림" 현상을 완화한다.
+    try {
+      await (document as Document & { fonts?: FontFaceSet }).fonts?.ready;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      wasm.refreshLayout();
+      canvasView?.loadDocument();
+    } catch (e) {
+      console.warn('[initDoc] refreshLayout(지연) 실패:', e);
+    }
+
+    if (fontReport && fontReport.missingCriticalFonts.length > 0) {
+      msg.textContent = `${displayName} (주의: 핵심 글꼴 누락 - 조판 오차 가능)`;
+      console.warn('[FontLoader] 핵심 글꼴 누락:', fontReport.missingCriticalFonts);
+    }
+
+    // #177: lineseg 비표준/불완전 데이터는 도형/표 밀림의 직접 원인이 되므로
+    // 사용자 선택 없이 자동 보정(reflow)한다.
     try {
       const report = wasm.getValidationWarnings();
+      warningCount = report.count;
       console.log(`[validation] ${report.count} warnings`, report.summary);
       if (report.count > 0) {
-        const choice = await showValidationModalIfNeeded(report);
-        console.log(`[validation] user choice: ${choice}`);
-        if (choice === 'auto-fix') {
-          const n = wasm.reflowLinesegs();
-          console.log(`[validation] reflowed ${n} paragraphs`);
-          // 렌더 재계산
-          canvasView?.loadDocument();
-          msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
-        }
+        // 정책: lineseg 경고가 있는 문서는 "쪽 안정성 우선"으로 보수적 페이지네이션 강제.
+        // 폰트 메트릭 미세 오차보다 쪽 밀림이 더 치명적이므로, vpos reset + legacy paginator를 함께 적용.
+        wasm.setRespectVposReset(true);
+        wasm.setUseLegacyPaginator(true);
+        const n = wasm.reflowLinesegs();
+        reflowedCount = n;
+        console.log(`[validation] auto-reflowed ${n} paragraphs`);
+        // 보정 후 즉시 재조판/재렌더링하여 페이지 밀림을 최소화
+        wasm.refreshLayout();
+        canvasView?.loadDocument();
+        msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
       }
     } catch (e) {
       console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
@@ -450,6 +621,7 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
     console.error('[initDoc] 오류:', error);
     if (window.innerWidth < 768) alert(`초기화 오류: ${error}`);
   }
+  return { warningCount, reflowedCount };
 }
 
 async function loadFile(file: File): Promise<void> {
@@ -475,7 +647,27 @@ async function loadBytes(
   const elapsed = performance.now() - startTime;
   // initializeDocument 안에서 #177 validation 모달이 표시될 수 있음.
   // HWPX 토스트는 모달과의 이벤트 충돌을 피하기 위해 모달 닫힌 후 표시.
-  await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`);
+  const initResult = await initializeDocument(
+    docInfo,
+    `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`,
+  );
+
+  // 구형 문서에서 lineseg 보정이 많이 발생하면 내부 저장 포맷으로 1회 정규화 재로드를 수행한다.
+  // 사용자가 "다시 저장하면 맞아지는" 현상을 로드 단계에서 자동 적용해 조판 흔들림을 줄인다.
+  if (initResult.reflowedCount > 0) {
+    try {
+      const normalizedBytes = wasm.exportHwp();
+      const normalizedInfo = wasm.loadDocument(normalizedBytes, fileName);
+      wasm.currentFileHandle = fileHandle;
+      await initializeDocument(
+        normalizedInfo,
+        `${fileName} — 정규화 재로딩 (${normalizedInfo.pageCount}페이지)`,
+      );
+      console.log(`[initDoc] normalize round-trip applied (${initResult.reflowedCount} lineseg fixes)`);
+    } catch (e) {
+      console.warn('[initDoc] normalize round-trip skipped:', e);
+    }
+  }
   notifyHwpxBetaIfNeeded();
 }
 
@@ -524,10 +716,14 @@ eventBus.on('open-document-bytes', async (payload) => {
     bytes: Uint8Array;
     fileName: string;
     fileHandle: typeof wasm.currentFileHandle;
+    requestId?: string;
   };
   try {
     await loadBytes(data.bytes, data.fileName, data.fileHandle);
+    eventBus.emit('open-document-bytes:done', { requestId: data.requestId, ok: true });
   } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    eventBus.emit('open-document-bytes:done', { requestId: data.requestId, ok: false, error: msg });
     // #265: WASM 파서 에러 (예: HWP 3.0 미지원) 를 사용자에게 전파
     showLoadError(error);
   }

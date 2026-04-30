@@ -70,6 +70,8 @@ pub struct DocumentCore {
     pub(crate) debug_overlay: bool,
     /// LINE_SEG vpos-reset 강제 분리 적용 여부 (페이지네이션 옵션)
     pub(crate) respect_vpos_reset: bool,
+    /// 레거시 paginator 강제 사용 여부 (문서별 레이아웃 호환 fallback)
+    pub(crate) use_legacy_paginator: bool,
     /// 구역별 표 측정 데이터 (페이지네이션 결과 보존)
     pub(crate) measured_tables: Vec<Vec<MeasuredTable>>,
     /// 구역별 dirty 플래그 (true = 재페이지네이션 필요)
@@ -211,6 +213,7 @@ impl DocumentCore {
             clip_enabled: true,
             debug_overlay: false,
             respect_vpos_reset: false,
+            use_legacy_paginator: false,
             measured_tables: Vec::new(),
             dirty_sections: Vec::new(),
             measured_sections: Vec::new(),

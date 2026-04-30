@@ -2323,6 +2323,10 @@ fn test_field_roundtrip(args: &[String]) {
 }
 
 fn ir_diff(args: &[String]) {
+    // IR-DIFF CLI 진입점.
+    // 핵심 전략: "동일 위치 인덱스 비교"
+    // - section index(sec_idx)와 paragraph index(pi)를 기준으로 A/B를 1:1 대응한다.
+    // - 따라서 문단 삽입/삭제가 있으면 그 이후 문단이 연쇄적으로 어긋나 보일 수 있다.
     if args.len() < 2 {
         eprintln!("사용법: rhwp ir-diff <파일A> <파일B> [-s <구역>] [-p <문단>]");
         return;
@@ -2333,6 +2337,9 @@ fn ir_diff(args: &[String]) {
     let mut section_filter: Option<usize> = None;
     let mut para_filter: Option<usize> = None;
 
+    // 선택 필터 파싱:
+    // -s/--section: 특정 구역만 비교
+    // -p/--para   : 특정 문단만 비교
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -2348,6 +2355,8 @@ fn ir_diff(args: &[String]) {
         }
     }
 
+    // 입력 파일 로드 + 파싱.
+    // 하나라도 실패하면 즉시 종료한다.
     let data_a = match fs::read(file_a) {
         Ok(d) => d,
         Err(e) => { eprintln!("오류: {} 읽기 실패: {}", file_a, e); return; }
@@ -2370,14 +2379,17 @@ fn ir_diff(args: &[String]) {
     let name_b = Path::new(file_b).file_name().unwrap_or_default().to_string_lossy();
     println!("=== IR 비교: {} vs {} ===", name_a, name_b);
 
-    // 구역 수 비교
+    // 1) 문서 상위 구조 차이: 구역 수
     if doc_a.sections.len() != doc_b.sections.len() {
         println!("[차이] 구역 수: A={} vs B={}", doc_a.sections.len(), doc_b.sections.len());
     }
 
+    // 비교 범위는 양쪽 공통 구간(min)까지만 본다.
     let sec_count = doc_a.sections.len().min(doc_b.sections.len());
     let mut total_diffs = 0u32;
 
+    // 2) 본문 비교(동일 위치 인덱스)
+    //    sec_idx -> pi 순서로 A/B 문단을 같은 인덱스로 맞춰 비교한다.
     for sec_idx in 0..sec_count {
         if let Some(sf) = section_filter {
             if sec_idx != sf { continue; }
@@ -2386,6 +2398,7 @@ fn ir_diff(args: &[String]) {
         let sec_a = &doc_a.sections[sec_idx];
         let sec_b = &doc_b.sections[sec_idx];
 
+        // 같은 구역 내 문단 개수 차이
         if sec_a.paragraphs.len() != sec_b.paragraphs.len() {
             println!("[차이] 구역 {}: 문단 수 A={} vs B={}", sec_idx, sec_a.paragraphs.len(), sec_b.paragraphs.len());
             total_diffs += 1;
@@ -2401,7 +2414,7 @@ fn ir_diff(args: &[String]) {
             let pb = &sec_b.paragraphs[pi];
             let mut diffs: Vec<String> = Vec::new();
 
-            // 텍스트 비교
+            // 텍스트 비교(로그 가독성을 위해 30자 미리보기만 출력)
             if pa.text != pb.text {
                 diffs.push(format!("text: A={:?} vs B={:?}",
                     pa.text.chars().take(30).collect::<String>(),
@@ -2413,7 +2426,9 @@ fn ir_diff(args: &[String]) {
                 diffs.push(format!("cc: A={} vs B={}", pa.char_count, pb.char_count));
             }
 
-            // char_offsets 비교
+            // char_offsets 비교:
+            // 길이가 다르면 길이 차이만,
+            // 길이가 같으면 첫 번째 불일치 인덱스만 출력(로그 폭 제어).
             if pa.char_offsets != pb.char_offsets {
                 let len_a = pa.char_offsets.len();
                 let len_b = pb.char_offsets.len();
@@ -2434,7 +2449,8 @@ fn ir_diff(args: &[String]) {
                 diffs.push(format!("ps_id: A={} vs B={}", pa.para_shape_id, pb.para_shape_id));
             }
 
-            // tab_extended 비교
+            // tab_extended 비교:
+            // 첫 불일치 지점만 출력.
             if pa.tab_extended.len() != pb.tab_extended.len() {
                 diffs.push(format!("tab_ext count: A={} vs B={}", pa.tab_extended.len(), pb.tab_extended.len()));
             } else {
@@ -2446,7 +2462,8 @@ fn ir_diff(args: &[String]) {
                 }
             }
 
-            // LINE_SEG 비교
+            // LINE_SEG 비교:
+            // line_height/segment_width/text_start를 라인 단위로 검사한다.
             if pa.line_segs.len() != pb.line_segs.len() {
                 diffs.push(format!("line_segs count: A={} vs B={}", pa.line_segs.len(), pb.line_segs.len()));
             } else {
@@ -2468,7 +2485,8 @@ fn ir_diff(args: &[String]) {
                 diffs.push(format!("controls: A={} vs B={}", pa.controls.len(), pb.controls.len()));
             }
 
-            // char_shapes 비교
+            // char_shapes 비교:
+            // start_pos와 char_shape_id 기준으로 첫 불일치만 출력.
             if pa.char_shapes.len() != pb.char_shapes.len() {
                 diffs.push(format!("char_shapes count: A={} vs B={}", pa.char_shapes.len(), pb.char_shapes.len()));
             } else {
@@ -2495,7 +2513,8 @@ fn ir_diff(args: &[String]) {
         }
     }
 
-    // doc_info 비교: ParaShape
+    // 3) doc_info 비교: ParaShape
+    // 문단에 연결되는 para_shape_id의 원본 속성 테이블 자체가 다른지 확인.
     {
         let ps_a = &doc_a.doc_info.para_shapes;
         let ps_b = &doc_b.doc_info.para_shapes;
@@ -2521,7 +2540,8 @@ fn ir_diff(args: &[String]) {
         }
     }
 
-    // doc_info 비교: TabDef
+    // 4) doc_info 비교: TabDef
+    // 탭 정의 테이블의 개수/항목(위치, 타입, 채움)을 비교.
     {
         let td_a = &doc_a.doc_info.tab_defs;
         let td_b = &doc_b.doc_info.tab_defs;
@@ -2547,6 +2567,7 @@ fn ir_diff(args: &[String]) {
         }
     }
 
+    // 최종 차이 건수 요약
     println!("\n=== 비교 완료: 차이 {} 건 ===", total_diffs);
 }
 

@@ -1015,12 +1015,9 @@ impl Paginator {
                         para_index: para_idx,
                         control_index: ctrl_idx,
                     });
-                    // 비-TAC 그림: 본문 공간을 차지하는 배치이면 높이 추가 (Task #10)
-                    if !pic.common.treat_as_char
-                        && matches!(pic.common.text_wrap,
-                            crate::model::shape::TextWrap::Square
-                            | crate::model::shape::TextWrap::TopAndBottom)
-                    {
+                    // 비-TAC 그림: 본문 흐름을 실제로 차지하는 경우에만 높이 반영.
+                    // Square는 대개 주변 줄바꿈으로 처리되므로 전체 높이 가산 시 과도한 페이지 밀림이 생길 수 있다.
+                    if Self::should_reserve_picture_height(pic, page_def, self.dpi) {
                         let pic_h = crate::renderer::hwpunit_to_px(pic.common.height as i32, self.dpi);
                         let margin_top = crate::renderer::hwpunit_to_px(pic.common.margin.top as i32, self.dpi);
                         let margin_bottom = crate::renderer::hwpunit_to_px(pic.common.margin.bottom as i32, self.dpi);
@@ -1923,5 +1920,40 @@ impl Paginator {
     /// 표의 세로 오프셋 추출
     fn get_table_vertical_offset(table: &crate::model::table::Table) -> u32 {
         table.common.vertical_offset as u32
+    }
+
+    /// 그림이 본문 높이 예약 대상인지 판정.
+    /// - InFront/Behind/Square: 예약하지 않음(오버플로로 쪽이 불필요하게 늘어나는 현상 방지)
+    /// - TopAndBottom: 본문을 실제로 밀어내는 배치만 예약
+    fn should_reserve_picture_height(
+        pic: &crate::model::image::Picture,
+        page_def: &crate::model::page::PageDef,
+        dpi: f64,
+    ) -> bool {
+        use crate::model::shape::{TextWrap, VertAlign, VertRelTo};
+
+        if pic.common.treat_as_char {
+            return false;
+        }
+        if !matches!(pic.common.text_wrap, TextWrap::TopAndBottom) {
+            return false;
+        }
+        if matches!(pic.common.vert_rel_to, VertRelTo::Page | VertRelTo::Paper)
+            && matches!(pic.common.vert_align, VertAlign::Bottom | VertAlign::Center)
+        {
+            return false;
+        }
+
+        // Paper 기준인데 본문(body) 위쪽(머리말 영역)에만 존재하면 본문 흐름을 밀지 않는다.
+        if matches!(pic.common.vert_rel_to, VertRelTo::Paper) {
+            let shape_top_abs = crate::renderer::hwpunit_to_px(pic.common.vertical_offset as i32, dpi);
+            let shape_bottom_abs =
+                shape_top_abs + crate::renderer::hwpunit_to_px(pic.common.height as i32, dpi);
+            let body_top = crate::renderer::hwpunit_to_px(page_def.margin_top as i32, dpi);
+            if shape_bottom_abs <= body_top {
+                return false;
+            }
+        }
+        true
     }
 }

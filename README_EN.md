@@ -69,7 +69,30 @@ Foundation  Typeset   Collab    Complete
 - Pagination (multi-column split, table row split), headers/footers, master pages, footnotes
 - SVG export (CLI) + Canvas rendering (WASM/Web)
 - Web editor + hwpctl-compatible API (30 Actions, Field API)
-- 935+ tests
+- 1,100+ tests
+
+#### v0.7.9 Cycle (2026-05-01)
+
+> Task #501 (Hancom defensive logic for cell.padding) + cherry-pick of PR #428/#494/#478/#498 + 4 external contributors
+
+**Maintainer Regression Fix**
+- mel-001.hwp page 2 table cell height regression ([#501](https://github.com/edwardkim/rhwp/issues/501)) — added a Hancom-defensive-logic mimic guard for the case where `cell.padding > cell.height` (1700 HU vs 1280 HU). Wrote troubleshooting and wiki ([HWP Cell Padding Defensive Logic](https://github.com/edwardkim/rhwp/wiki/HWP-%EC%85%80-Padding-%EB%B0%A9%EC%96%B4-%EB%A1%9C%EC%A7%81))
+
+**External PR Cherry-picks (3 PRs / 17 commits)**
+- Picture serialization within group (external contribution by [@oksure](https://github.com/oksure) — PR [#428](https://github.com/edwardkim/rhwp/pull/428))
+- `Paragraph::utf16_pos_to_char_idx` public API ([#484](https://github.com/edwardkim/rhwp/issues/484)) — external contribution by [@DanMeon](https://github.com/DanMeon), PR [#494](https://github.com/edwardkim/rhwp/pull/494)
+- Layout/equation fixes bundled (7 Tasks / 10 commits — #488/#490/#483/#489/#495/#480/#476) — external contribution by [@planet6897](https://github.com/planet6897), PR [#478](https://github.com/edwardkim/rhwp/pull/478)
+
+**Regression Verification Infrastructure (External)**
+- Canvas visual diff pipeline (legacy Canvas ↔ PageLayerTree replay automated pixel diff, relates [#364](https://github.com/edwardkim/rhwp/issues/364)) — external contribution by [@seo-rii](https://github.com/seo-rii), PR [#498](https://github.com/edwardkim/rhwp/pull/498)
+
+#### v0.7.8 Cycle (2026-04-29)
+
+> Multiple external contributors + maintainer regression fixes + wiki/README organization — 15 external PRs cherry-picked
+
+#### v0.7.7 Cycle (2026-04-27)
+
+> v0.7.6 regression fix cycle — TypesetEngine pagination drift / page_num refresh / PartialTable + Square wrap (8 items consolidated)
 
 #### Recent Changes (v0.7.3 / extension v0.2.1, 2026-04-21)
 
@@ -106,7 +129,7 @@ Foundation  Typeset   Collab    Complete
 - Content-script `init()` gate split to honor hoverPreview / autoOpen independently from showBadges (external contribution by [@postmelee](https://github.com/postmelee) — PR [#224](https://github.com/edwardkim/rhwp/pull/224))
 
 **Thanks to contributors**
-This release cycle: [@ahnbu](https://github.com/ahnbu), [@bapdodi](https://github.com/bapdodi), [@dreamworker0](https://github.com/dreamworker0), [@marsimon](https://github.com/marsimon), [@postmelee](https://github.com/postmelee), [@seunghan91](https://github.com/seunghan91), [@seo-rii](https://github.com/seo-rii), [@planet6897](https://github.com/planet6897), [@yl-star7](https://github.com/yl-star7)
+v0.7.x cycle cumulative external contributors: [@ahnbu](https://github.com/ahnbu), [@bapdodi](https://github.com/bapdodi), [@cskwork](https://github.com/cskwork), [@DanMeon](https://github.com/DanMeon), [@dreamworker0](https://github.com/dreamworker0), [@marsimon](https://github.com/marsimon), [@oksure](https://github.com/oksure), [@planet6897](https://github.com/planet6897), [@postmelee](https://github.com/postmelee), [@seanshin](https://github.com/seanshin), [@seo-rii](https://github.com/seo-rii), [@seunghan91](https://github.com/seunghan91), [@yl-star7](https://github.com/yl-star7)
 
 ### v1.0.0 — Typesetting Engine
 
@@ -169,9 +192,25 @@ See the [roadmap document](mydocs/eng/report/rhwp-milestone.md) for details.
 - vpos-based paragraph position correction
 
 ### Output
-- SVG export (CLI)
+- SVG export (CLI, legacy + layer replay)
 - Canvas rendering (WASM/Web)
 - Debug overlay (paragraph/table boundaries + indices + y-coordinates)
+
+### Multi-Renderer Backends
+- `PageRenderTree` can be lowered into a `PageLayerTree` paint IR before backend replay.
+- P1 public surfaces are Rust native `DocumentCore::build_page_layer_tree(page)` and WASM `getPageLayerTree(page)`.
+- Layer JSON starts at `schemaVersion: 1`, uses `unit: "px"`, and uses `coordinateSystem: "page-top-left"` to match the existing page render coordinates.
+- Compatible schema changes should be additive; incompatible JSON shape changes require a schema version bump.
+- **Legacy SVG** remains the default compatibility output.
+- **Layered SVG** can be exercised with `RHWP_RENDER_PATH=layer-svg`.
+- The layered SVG path is a transition adapter that expands `PageLayerTree` back into the existing SVG renderer.
+- Browser/native Canvas paths render through `PageLayerTree` replay by default.
+- Legacy Canvas remains available through `renderPageCanvasLegacy` / `renderPageToCanvasLegacy` for parity checks.
+- P3 visual regression coverage runs `npm run e2e:render-diff:ci` in `rhwp-studio` to compare legacy Canvas and layer Canvas in Chromium; CI uploads render-diff artifacts and writes a summary.
+- The default render-diff fixtures cover basic text/table output, business-document layout, and treat-as-char object placement; override with `RHWP_RENDER_DIFF_FILES`, `RHWP_RENDER_DIFF_MAX_PAGES`, or `RHWP_RENDER_DIFF_ALL=1`.
+- C ABI export is intentionally left for a later PR.
+- `ResourceArena` is reserved in `PageLayerTree`; binary resource interning is not implemented yet.
+- This phase establishes the frontend/backend boundary for later CanvasKit and native Skia backends.
 
 ### Web Editor
 - Text editing (insert, delete, undo/redo)
@@ -246,7 +285,7 @@ New contributors: start with the [onboarding guide](mydocs/eng/manual/onboarding
 ```bash
 cargo build                    # Development build
 cargo build --release          # Release build
-cargo test                     # Run tests (935+ tests)
+cargo test                     # Run tests (1,100+ tests)
 ```
 
 ### WASM Build
@@ -341,7 +380,7 @@ mydocs/                        # Project documentation (Korean)
 ├── feedback/                  # Code review feedback
 ├── tech/                      # Technical documents
 └── manual/                    # Manuals and guides
-mydocs/eng/                    # English translations (724 files)
+mydocs/eng/                    # English translations (2,200+ files)
 
 scripts/                       # Build & quality tools
 ├── metrics.sh                 # Code quality metrics collection
@@ -362,10 +401,10 @@ This project takes the opposite approach. A human **task director** maintains fu
 |--|-------------|-------------|
 | **Human role** | Accept AI output | Direct, review, decide |
 | **Planning** | None — "just build it" | Written plan → approval → execution |
-| **Quality gate** | Hope it works | 935 tests + Clippy + CI + code review |
+| **Quality gate** | Hope it works | 1,100+ tests + Clippy + CI + code review |
 | **Debugging** | Ask AI to fix AI's bugs | Human diagnoses, AI implements fix |
 | **Architecture** | Emergent (accidental) | Deliberate (CQRS, dependency direction) |
-| **Documentation** | None | 724 files of process records |
+| **Documentation** | None | 2,200+ files of process records |
 | **Outcome** | Fragile, hard to maintain | Production-grade, 100K+ lines |
 
 AI is a force multiplier, but a multiplier amplifies whatever process you already have. No process × AI = fast chaos. Good process × AI = extraordinary output.
@@ -384,7 +423,7 @@ Makes architectural decisions →    Executes with precision
 Judges quality & correctness  ←    Generates code, docs, tests
 ```
 
-The `mydocs/` directory (724 files, English translations in `mydocs/eng/`) contains the complete development record: daily task logs, implementation plans, code review feedback, technical research documents, and debugging records.
+The `mydocs/` directory (2,200+ files, English translations in `mydocs/eng/`) contains the complete development record: daily task logs, implementation plans, code review feedback, technical research documents, and debugging records.
 
 > `mydocs/` is not documentation about the code — it is documentation about **how to build software with AI**. It is an open-source methodology.
 
@@ -482,10 +521,25 @@ Contributions are welcome. Please note the following first:
 - **Target branch for PRs is `devel`**, not `main`. Although the GitHub default branch is `main`, all contributor PRs go to `devel`.
 - **Check first**: Look at [open issues](https://github.com/edwardkim/rhwp/issues) and [open PRs](https://github.com/edwardkim/rhwp/pulls) to avoid duplicating in-progress work.
 - **Issue close is by maintainer**: Submit only the PR for completed work. The maintainer will close the issue when the PR is merged.
+- **Hancom PDFs are not authoritative ground truth**: PDF output differs across Hancom tools (Editor / Viewer / Hancom Docs), versions (2010 / 2020 / 2022), and output paths (Hancom-native / OS print). See the [Hancom PDF Environment Dependency wiki](https://github.com/edwardkim/rhwp/wiki/한컴-PDF-환경-의존성) for environment-specific comparison data and PR review guidance.
 
 For the full contribution flow (fork → branch → commit → PR), see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Questions and ideas are welcome on [Discussions](https://github.com/edwardkim/rhwp/discussions).
+
+### Wiki Resources
+
+Authoritative resources useful to contributors and fork users are organized in the [Wiki](https://github.com/edwardkim/rhwp/wiki):
+
+- [Hancom PDF Environment Dependency](https://github.com/edwardkim/rhwp/wiki/한컴-PDF-환경-의존성) — PDF differences across Hancom tools / versions / OS, and PR verification guidance
+- [HWP 5.0 Spec Errata](https://github.com/edwardkim/rhwp/wiki/HWP-5.0-Spec-Errata) — HWP 5.0 spec errata
+- [Understanding HWP LINE_SEG vpos](https://github.com/edwardkim/rhwp/wiki/HWP-LINE_SEG-vpos-이해)
+- [HWP Tab Leader Rendering](https://github.com/edwardkim/rhwp/wiki/HWP-Tab-Leader-Rendering)
+- [Export API Guide](https://github.com/edwardkim/rhwp/wiki/Export-API-사용-가이드) — exportHwp / exportHwpx APIs
+- [Cloudflared for rhwp-studio external HTTPS access](https://github.com/edwardkim/rhwp/wiki/Cloudflared-로-rhwp-studio-외부-HTTPS-접근)
+- [Hyper-Waterfall Document Guide](https://github.com/edwardkim/rhwp/wiki/Hyper‐Waterfall-문서-체계-가이드)
+- [Investigation PR Guide](https://github.com/edwardkim/rhwp/wiki/Investigation-PR-가이드)
+- [Legal FAQ](https://github.com/edwardkim/rhwp/wiki/Legal-FAQ)
 
 ## Notice
 

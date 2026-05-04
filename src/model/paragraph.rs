@@ -718,6 +718,114 @@ impl Paragraph {
         Some(result_id)
     }
 
+    /// 인라인 컨트롤이 텍스트의 어느 character 인덱스에 위치하는지 반환한다.
+    ///
+    /// 일반 경로에서는 `char_offsets` 갭 (인라인 컨트롤당 8 UTF-16 코드 유닛) 의 길이만으로
+    /// position 을 분배한다 — 컨트롤 variant 를 보지 않으므로 각주·미주, 그림, 표, 수식,
+    /// 자동번호 등 모든 inline 컨트롤이 동일하게 character offset 을 부여받는다.
+    ///
+    /// `char_offsets` 가 비어있는 폴백 경로에서는 Shape/Table/Picture/Equation 만 폭 1을
+    /// 가산하고, 그 외 컨트롤은 모두 position 0 에 누적된다 (정밀도 손실 분기).
+    ///
+    /// # Returns
+    ///
+    /// `positions[i]` = `controls[i]` 가 삽입되어야 할 텍스트 character 인덱스.
+    /// 컨트롤이 없으면 빈 벡터.
+    pub fn control_text_positions(&self) -> Vec<usize> {
+        let offsets = &self.char_offsets;
+        let total_controls = self.controls.len();
+
+        if total_controls == 0 {
+            return vec![];
+        }
+
+        if offsets.is_empty() {
+            // char_offsets가 없는 경우: 인라인 컨트롤을 순차적으로 배치
+            // secd/cold 등 비인라인 컨트롤은 position 0, 인라인 컨트롤은 순차 증가
+            let mut pos = 0usize;
+            let mut positions = Vec::with_capacity(total_controls);
+            for ctrl in &self.controls {
+                positions.push(pos);
+                if matches!(
+                    ctrl,
+                    Control::Shape(_)
+                        | Control::Table(_)
+                        | Control::Picture(_)
+                        | Control::Equation(_)
+                ) {
+                    pos += 1;
+                }
+            }
+            return positions;
+        }
+
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut positions = Vec::with_capacity(total_controls);
+
+        // 첫 문자 이전의 갭: 확장 컨트롤이 텍스트 시작 전에 있는 경우
+        let gap_before = offsets[0] as usize;
+        let n_ctrls_before = gap_before / 8;
+        for _ in 0..n_ctrls_before {
+            if positions.len() >= total_controls {
+                break;
+            }
+            positions.push(0);
+        }
+
+        // 연속된 문자 사이의 갭
+        for i in 0..offsets.len().saturating_sub(1) {
+            if positions.len() >= total_controls {
+                break;
+            }
+            let current_off = offsets[i] as usize;
+            let next_off = offsets[i + 1] as usize;
+            let char_width = if chars.get(i).map_or(false, |&c| c as u32 > 0xFFFF) {
+                2
+            } else {
+                1
+            };
+            if next_off > current_off + char_width {
+                let gap = next_off - current_off - char_width;
+                let n_ctrls = gap / 8;
+                for _ in 0..n_ctrls {
+                    if positions.len() >= total_controls {
+                        break;
+                    }
+                    positions.push(i + 1); // 현재 문자 다음에 삽입
+                }
+            }
+        }
+
+        // 마지막 문자 이후의 컨트롤 (드문 경우)
+        while positions.len() < total_controls {
+            positions.push(chars.len());
+        }
+
+        positions
+    }
+
+    /// `char_offsets` 중 UTF-16 위치 `utf16_pos` 이상인 첫 번째 codepoint 의
+    /// 인덱스를 반환한다. 모든 entry 가 작으면 `char_offsets.len()` (텍스트 끝).
+    ///
+    /// `char_shapes[i].start_pos` 와 `line_segs[i].text_start` 같은 UTF-16
+    /// 단위 위치 필드를 codepoint 인덱스로 정규화할 때 사용한다.
+    ///
+    /// 본 메서드는 `document_core::helpers::utf16_pos_to_char_idx` 와 동일
+    /// 알고리즘이나, 시그니처 호환성 (raw `&[u32]` vs `&self`) 때문에 본체를
+    /// 자체 보유한다 — 의존성 방향 (model ← document_core) 보존. 알고리즘이
+    /// 1줄 (`iter().position`) 이라 silent drift 위험은 무시 가능.
+    ///
+    /// # Returns
+    ///
+    /// `char_offsets` 첫 entry 가 `utf16_pos` 이상인 인덱스. 모든 entry 가
+    /// 작으면 `char_offsets.len()`.
+    pub fn utf16_pos_to_char_idx(&self, utf16_pos: u32) -> usize {
+        self.char_offsets
+            .iter()
+            .position(|&off| off >= utf16_pos)
+            .unwrap_or(self.char_offsets.len())
+    }
+
     /// [start_char_offset, end_char_offset) 범위에 new_char_shape_id를 적용한다.
     ///
     /// CharShapeRef 배열을 분할/교체하여 지정 범위만 새 ID로 변경한다.

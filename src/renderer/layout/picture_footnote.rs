@@ -91,6 +91,15 @@ impl LayoutEngine {
             }
         };
 
+        // 원본 이미지 크기(HU) — crop 좌표 보정용
+        let original_size_hu = if picture.shape_attr.original_width > 0
+            && picture.shape_attr.original_height > 0
+        {
+            Some((picture.shape_attr.original_width, picture.shape_attr.original_height))
+        } else {
+            None
+        };
+
         // 이미지 노드 생성
         let img_id = tree.next_id();
         let img_node = RenderNode::new(
@@ -100,7 +109,11 @@ impl LayoutEngine {
                 para_index,
                 control_index,
                 crop,
+                original_size_hu,
                 effect: picture.image_attr.effect,
+                brightness: picture.image_attr.brightness,
+                contrast: picture.image_attr.contrast,
+                text_wrap: Some(picture.common.text_wrap),
                 ..ImageNode::new(bin_data_id, image_data)
             }),
             BoundingBox::new(pic_x, pic_y, pic_width, pic_height),
@@ -288,6 +301,15 @@ impl LayoutEngine {
             }
         };
 
+        // 원본 이미지 크기(HU)
+        let original_size_hu = if picture.shape_attr.original_width > 0
+            && picture.shape_attr.original_height > 0
+        {
+            Some((picture.shape_attr.original_width, picture.shape_attr.original_height))
+        } else {
+            None
+        };
+
         // 이미지 노드 생성
         let img_id = tree.next_id();
         let img_node = RenderNode::new(
@@ -297,7 +319,11 @@ impl LayoutEngine {
                 para_index: Some(para_index),
                 control_index: Some(control_index),
                 crop,
+                original_size_hu,
                 effect: picture.image_attr.effect,
+                brightness: picture.image_attr.brightness,
+                contrast: picture.image_attr.contrast,
+                text_wrap: Some(picture.common.text_wrap),
                 ..ImageNode::new(bin_data_id, image_data)
             }),
             BoundingBox::new(adjusted_pic_x, pic_y, pic_width, pic_height),
@@ -350,10 +376,13 @@ impl LayoutEngine {
         // y_offset 업데이트: Para 기준 그림만 높이만큼 진행
         // Page/Paper 기준 그림은 플로팅이므로 y_offset 변경 없음
         // Task #347: 글뒤로/글앞으로 그림은 본문 흐름을 점유하지 않으므로 y 미진행.
+        // base_y는 vert_offset이 적용된 실제 그림 상단 y이므로, base_y + total_height가
+        // 그림 하단 y가 된다. y_offset(앵커 단락 y) 대신 base_y를 기준으로 반환해야
+        // vert_offset이 있는 혼합 단락(텍스트+그림)에서 후속 단락이 그림 위로 겹치지 않는다.
         let total_height = pic_height + caption_height + if caption_height > 0.0 { caption_spacing } else { 0.0 };
         match (picture.common.vert_rel_to, picture.common.text_wrap) {
             (VertRelTo::Para, TextWrap::BehindText | TextWrap::InFrontOfText) => y_offset,
-            (VertRelTo::Para, _) => y_offset + total_height,
+            (VertRelTo::Para, _) => base_y + total_height,
             (VertRelTo::Page | VertRelTo::Paper, _) => y_offset,
         }
     }
@@ -549,17 +578,34 @@ impl LayoutEngine {
                     .map(|cs| cs.char_shape_id as u32)
                     .unwrap_or(composed.para_style_id as u32);
 
+                // [Issue #483] 각주의 마지막 paragraph 는 trailing line_spacing 미적용
+                // — 다음 각주와의 간격은 note_spacing 이 책임. trailing ls 까지 합산하면
+                // 각주 사이 gap 이 line_spacing 만큼 부풀려짐.
+                let is_last_para_of_fn = p_idx + 1 == fn_paras.len();
+
                 if p_idx == 0 {
                     // 첫 문단: 각주 번호를 텍스트 앞에 삽입
                     y = self.layout_footnote_paragraph_with_number(
                         tree, fn_node, &composed, styles, fn_area, y, &number_text,
                         marker_section, marker_para, base_cs_id,
+                        is_last_para_of_fn,
                     );
                 } else {
-                    y = self.layout_composed_paragraph(
+                    let returned_y = self.layout_composed_paragraph(
                         tree, fn_node, &composed, styles, fn_area, y, 0, composed.lines.len(),
                         marker_section, marker_para, None, false, 0.0, None, None, None,
                     );
+                    if is_last_para_of_fn {
+                        // layout_composed_paragraph 가 마지막 line 의 trailing line_spacing 을
+                        // 포함시키므로, 각주 마지막 paragraph 에서는 그만큼 빼서 note_spacing
+                        // 과의 이중 합산을 막는다.
+                        let trail_ls = composed.lines.last()
+                            .map(|l| hwpunit_to_px(l.line_spacing, self.dpi))
+                            .unwrap_or(0.0);
+                        y = returned_y - trail_ls;
+                    } else {
+                        y = returned_y;
+                    }
                 }
             }
 
@@ -585,6 +631,9 @@ impl LayoutEngine {
         marker_section: usize,
         marker_para: usize,
         base_cs_id: u32,
+        // [Issue #483] true 면 각주의 마지막 paragraph — 마지막 line 의 trailing
+        // line_spacing 을 누적하지 않는다 (note_spacing 과 이중 합산 방지).
+        is_last_para_of_fn: bool,
     ) -> f64 {
         let mut y = y_start;
 
@@ -675,7 +724,17 @@ impl LayoutEngine {
             }
 
             parent.children.push(line_node);
-            y += line_height;
+            // [Issue #483] trailing line_spacing 추가 — layout_composed_paragraph:2560 과 정합.
+            // 단, 각주의 마지막 paragraph 의 마지막 line 에서는 trailing line_spacing 을
+            // 누적하지 않는다 — 다음 각주와의 간격은 note_spacing 이 책임하므로
+            // 이중 합산을 피하기 위함.
+            let is_last_line = line_idx + 1 >= composed.lines.len();
+            if is_last_para_of_fn && is_last_line {
+                y += line_height;
+            } else {
+                let line_spacing_px = hwpunit_to_px(comp_line.line_spacing, self.dpi);
+                y += line_height + line_spacing_px;
+            }
         }
 
         // 빈 문단 fallback

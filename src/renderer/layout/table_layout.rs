@@ -232,9 +232,25 @@ impl LayoutEngine {
         }
 
         let table_text_wrap = if depth == 0 { table.common.text_wrap } else { crate::model::shape::TextWrap::Square };
-        // inline_x_override가 있으면 외부에서 이미 위치를 계산했으므로 y_start 그대로 사용
+        let inline_top_caption_offset = if inline_x_override.is_some() && depth == 0 {
+            if let Some(ref caption) = table.caption {
+                use crate::model::shape::CaptionDirection;
+                if matches!(caption.direction, CaptionDirection::Top) {
+                    caption_height + caption_spacing
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // inline_x_override가 있으면 외부에서 inline 위치를 계산했으므로 x/y 기준은 유지한다.
+        // 단, Top 캡션은 표 본문 위의 별도 영역이므로 표 본문 y 에 캡션 높이만큼 반영한다.
         let table_y = if inline_x_override.is_some() {
-            y_start
+            y_start + inline_top_caption_offset
         } else {
             self.compute_table_y_position(
                 table, table_height, y_start, col_area, depth, caption_height, caption_spacing,
@@ -264,6 +280,7 @@ impl LayoutEngine {
                 self.render_cell_background(
                     tree, &mut table_node, Some(tbl_bs),
                     table_x, table_y, table_width, table_height,
+                    bin_data_content,
                 );
             }
         }
@@ -297,23 +314,9 @@ impl LayoutEngine {
                     });
                     let zone_w = (zone_x_end - zone_x).max(0.0);
                     let zone_h = (zone_y_end - zone_y).max(0.0);
-                    // 단색/패턴/그라데이션 배경
-                    self.render_cell_background(tree, &mut table_node, Some(zone_bs), zone_x, zone_y, zone_w, zone_h);
-                    // 이미지 채우기
-                    if let Some(ref img_fill) = zone_bs.image_fill {
-                        if let Some(img_content) = crate::renderer::layout::find_bin_data(bin_data_content, img_fill.bin_data_id) {
-                            let img_id = tree.next_id();
-                            let img_node = RenderNode::new(
-                                img_id,
-                                RenderNodeType::Image(ImageNode {
-                                    fill_mode: Some(img_fill.fill_mode),
-                                    ..ImageNode::new(img_fill.bin_data_id, Some(img_content.data.clone()))
-                                }),
-                                BoundingBox::new(zone_x, zone_y, zone_w, zone_h),
-                            );
-                            table_node.children.push(img_node);
-                        }
-                    }
+                    // [Task #429] 단색/패턴/그라데이션 + 이미지 채우기 (zone 의 별도 image fill 처리는
+                    // render_cell_background 가 통합 처리하므로 제거)
+                    self.render_cell_background(tree, &mut table_node, Some(zone_bs), zone_x, zone_y, zone_w, zone_h, bin_data_content);
                 }
             }
         }
@@ -813,6 +816,23 @@ impl LayoutEngine {
         } else {
             hwpunit_to_px(table.padding.bottom as i32, self.dpi)
         };
+        // [Task #501] 한컴 방어 로직 모방 — cell.padding.top + bottom 합산이
+        // cell.height 자체를 초과하면 (mel-001 p2 셀[21]: pad=1700 HU 두 축, h=1280 HU)
+        // 한컴은 자체 가드로 cell 안에 콘텐츠가 들어가도록 처리. cell.height 의 절반까지
+        // 비례 축소 (HWP 스펙 외 한컴 동작 모방).
+        let (pad_top, pad_bottom) = if cell.height < 0x80000000 {
+            let cell_h_px = hwpunit_to_px(cell.height as i32, self.dpi);
+            let total_v_pad = pad_top + pad_bottom;
+            if cell_h_px > 0.0 && total_v_pad >= cell_h_px {
+                let max_v_pad = cell_h_px * 0.5;
+                let scale = max_v_pad / total_v_pad;
+                (pad_top * scale, pad_bottom * scale)
+            } else {
+                (pad_top, pad_bottom)
+            }
+        } else {
+            (pad_top, pad_bottom)
+        };
         (pad_left, pad_right, pad_top, pad_bottom)
     }
 
@@ -877,6 +897,7 @@ impl LayoutEngine {
         cell_node: &mut RenderNode,
         border_style: Option<&crate::renderer::style_resolver::ResolvedBorderStyle>,
         cell_x: f64, cell_y: f64, cell_w: f64, cell_h: f64,
+        bin_data_content: &[BinDataContent],
     ) {
         let fill_color = border_style.and_then(|bs| bs.fill_color);
         let pattern = border_style.and_then(|bs| bs.pattern);
@@ -899,6 +920,21 @@ impl LayoutEngine {
                 BoundingBox::new(cell_x, cell_y, cell_w, cell_h),
             );
             cell_node.children.push(rect_node);
+        }
+        // [Task #429] image fill 처리 — zone 처리와 동일 패턴
+        if let Some(img_fill) = border_style.and_then(|bs| bs.image_fill.as_ref()) {
+            if let Some(img_content) = crate::renderer::layout::find_bin_data(bin_data_content, img_fill.bin_data_id) {
+                let img_id = tree.next_id();
+                let img_node = RenderNode::new(
+                    img_id,
+                    RenderNodeType::Image(ImageNode {
+                        fill_mode: Some(img_fill.fill_mode),
+                        ..ImageNode::new(img_fill.bin_data_id, Some(img_content.data.clone()))
+                    }),
+                    BoundingBox::new(cell_x, cell_y, cell_w, cell_h),
+                );
+                cell_node.children.push(img_node);
+            }
         }
     }
 
@@ -1151,7 +1187,7 @@ impl LayoutEngine {
             };
 
             // (a) 셀 배경
-            self.render_cell_background(tree, &mut cell_node, border_style, cell_x, cell_y, cell_w, cell_h);
+            self.render_cell_background(tree, &mut cell_node, border_style, cell_x, cell_y, cell_w, cell_h, bin_data_content);
 
             // 셀 패딩 (cell.padding이 0이면 table.padding fallback)
             let (mut pad_left, mut pad_right, pad_top, pad_bottom) = self.resolve_cell_padding(cell, table);
@@ -1530,13 +1566,22 @@ impl LayoutEngine {
                                     }
 
                                     let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                                    // [Task #477] 셀 폭 초과 시 비율 유지 클램프
+                                    let clamped_w = pic_w.min(inner_area.width);
+                                    let clamped_h = if pic_w > 0.0 {
+                                        pic_h * (clamped_w / pic_w)
+                                    } else {
+                                        pic_h
+                                    };
                                     let pic_area = LayoutRect {
                                         x: inline_x,
                                         y: tac_img_y,
-                                        width: pic_w,
-                                        height: pic_h,
+                                        width: clamped_w,
+                                        height: clamped_h,
                                     };
                                     self.layout_picture(tree, &mut cell_node, pic, &pic_area, bin_data_content, Alignment::Left, Some(section_index), None, None);
+                                    inline_x += clamped_w;
+                                    continue;
                                 }
                                 inline_x += pic_w;
                             } else {
@@ -1571,22 +1616,36 @@ impl LayoutEngine {
                                 // Shape 앞의 텍스트 너비 계산: tac_controls에서 이 Shape의 text_pos와
                                 // 이전 Shape의 text_pos 차이에 해당하는 텍스트 너비를 inline_x에 반영
                                 if let Some(&(tac_pos, _, _)) = composed.tac_controls.iter().find(|&&(_, _, ci)| ci == ctrl_idx) {
-                                    // 이 Shape 앞에 아직 inline_x에 반영되지 않은 텍스트가 있는지 계산
-                                    let text_before: String = composed.lines.first()
+                                    // [Task #495] 가드: 사각형이 paragraph 첫 줄(ls[0]) 범위 안에 있을 때만
+                                    // text_before 추출/발행. multi-line paragraph 에서 사각형이 ls[1]+ 에
+                                    // 있는 경우 composed.lines.first() 만 보던 기존 코드는 첫 줄 전체
+                                    // 텍스트를 잘못 추출해 paragraph_layout 결과와 중복 발행했음.
+                                    let in_first_line = composed.lines.first()
                                         .map(|line| {
-                                            let mut chars_so_far = 0usize;
-                                            let mut result = String::new();
-                                            for run in &line.runs {
-                                                for ch in run.text.chars() {
-                                                    if chars_so_far >= prev_tac_text_pos && chars_so_far < tac_pos {
-                                                        result.push(ch);
-                                                    }
-                                                    chars_so_far += 1;
-                                                }
-                                            }
-                                            result
+                                            let line_chars: usize = line.runs.iter().map(|r| r.text.chars().count()).sum();
+                                            tac_pos >= line.char_start && tac_pos < line.char_start + line_chars
                                         })
-                                        .unwrap_or_default();
+                                        .unwrap_or(false);
+                                    // 이 Shape 앞에 아직 inline_x에 반영되지 않은 텍스트가 있는지 계산
+                                    let text_before: String = if in_first_line {
+                                        composed.lines.first()
+                                            .map(|line| {
+                                                let mut chars_so_far = 0usize;
+                                                let mut result = String::new();
+                                                for run in &line.runs {
+                                                    for ch in run.text.chars() {
+                                                        if chars_so_far >= prev_tac_text_pos && chars_so_far < tac_pos {
+                                                            result.push(ch);
+                                                        }
+                                                        chars_so_far += 1;
+                                                    }
+                                                }
+                                                result
+                                            })
+                                            .unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    };
                                     if !text_before.is_empty() {
                                         let char_style_id = composed.lines.first()
                                             .and_then(|l| l.runs.first())
@@ -2068,6 +2127,11 @@ impl LayoutEngine {
         let has_offset = content_offset > 0.0;
         let has_limit = content_limit > 0.0;
         let mut cum: f64 = 0.0;
+        // [Task #431] content_limit 은 현재 페이지에서 표시할 상대 길이(px) 의미이므로
+        // 절대 좌표(cum 기반)와 비교하려면 content_offset 을 더해 절대 끝 좌표로 변환한다.
+        // (Task #362 의 도입 시점에 단위 mismatch 가 있었음 — content_offset >= content_limit
+        // 케이스에서 셀 내 문단이 즉시 break 되어 빈 페이지로 출력되던 결함 정정.)
+        let abs_limit = if has_limit { content_offset + content_limit } else { 0.0 };
 
         let total_paras = composed_paras.len();
         for (pi, (comp, para)) in composed_paras.iter().zip(cell.paragraphs.iter()).enumerate() {
@@ -2117,7 +2181,8 @@ impl LayoutEngine {
                 // v0.7.3 의 처리 시멘틱과 동일.
                 let was_on_prev = has_offset && para_end_pos <= content_offset;
                 let bigger_than_page = has_limit && para_h > content_limit;
-                let exceeds_limit = has_limit && para_end_pos > content_limit && !bigger_than_page;
+                // [Task #431] abs_limit (= content_offset + content_limit) 와 비교 (단위 정합)
+                let exceeds_limit = has_limit && para_end_pos > abs_limit && !bigger_than_page;
                 let visible_count = if line_count == 0 { 0 } else { line_count };
                 if was_on_prev || exceeds_limit {
                     // (n,n): 렌더 스킵 마커. line_count==0 이면 (0,0) 동일.
@@ -2156,7 +2221,8 @@ impl LayoutEngine {
                     continue;
                 }
 
-                if has_limit && line_end_pos > content_limit {
+                if has_limit && line_end_pos > abs_limit {
+                    // [Task #431] abs_limit (= content_offset + content_limit) 와 비교 (단위 정합)
                     // limit 초과 → 이 줄과 이후 모든 콘텐츠 차단
                     break;
                 }

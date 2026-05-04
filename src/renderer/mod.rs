@@ -3,6 +3,8 @@
 //! IR(Document Model) → 렌더 트리 → 백엔드 렌더링 파이프라인을 구현한다.
 //! Renderer Trait으로 추상화하여 Canvas/SVG/HTML 백엔드를 선택할 수 있다.
 
+use serde::Serialize;
+
 use crate::model::style::{LineSpacingType, UnderlineType};
 
 pub mod canvas;
@@ -11,14 +13,18 @@ pub mod equation;
 pub mod font_metrics_data;
 pub mod height_measurer;
 pub mod html;
+pub mod layer_renderer;
 pub mod layout;
 pub mod page_layout;
+pub mod page_number;
 pub mod pagination;
+pub mod pua_oldhangul;
 pub mod render_tree;
 pub mod scheduler;
 pub mod style_resolver;
 pub mod svg;
 pub mod svg_fragment;
+pub mod svg_layer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pdf;
 pub mod typeset;
@@ -51,7 +57,7 @@ impl RenderBackend {
 }
 
 /// 탭 정지 (렌더링용)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TabStop {
     /// 절대 위치 (px, 단 시작 기준)
     pub position: f64,
@@ -62,7 +68,7 @@ pub struct TabStop {
 }
 
 /// 탭 리더(채움 기호) 렌더링 정보
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TabLeaderInfo {
     /// 리더 시작 x (run 내 상대 좌표)
     pub start_x: f64,
@@ -73,7 +79,7 @@ pub struct TabLeaderInfo {
 }
 
 /// 텍스트 렌더링 스타일
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TextStyle {
     /// 글꼴 이름
     pub font_family: String,
@@ -111,6 +117,10 @@ pub struct TextStyle {
     pub extra_word_spacing: f64,
     /// 배분/나눔 정렬용: 글자당 추가 간격 (px)
     pub extra_char_spacing: f64,
+    /// Task #352: dash leader (3+ 연속 '-') 시퀀스의 글자당 추가 간격 (px).
+    /// PDF 와 같이 라인 슬랙을 dash leader 가 흡수하도록 하여, 공백 분배
+    /// 부담을 줄이고 자연스러운 단어 간격을 유지한다. 0 이면 미적용.
+    pub extra_dash_advance: f64,
     /// 외곽선 종류 (0=없음, 1~6=종류)
     pub outline_type: u8,
     /// 그림자 종류 (0=없음, 1=비연속, 2=연속)
@@ -176,6 +186,7 @@ impl Default for TextStyle {
             inline_tabs: Vec::new(),
             extra_word_spacing: 0.0,
             extra_char_spacing: 0.0,
+            extra_dash_advance: 0.0,
             outline_type: 0,
             shadow_type: 0,
             shadow_color: 0x00B2B2B2,
@@ -196,7 +207,7 @@ impl Default for TextStyle {
 }
 
 /// 패턴 채우기 정보 (HWP pattern_type 1~6)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct PatternFillInfo {
     /// 패턴 종류 (1=가로줄, 2=세로줄, 3=역대각선, 4=대각선, 5=십자, 6=격자)
     pub pattern_type: i32,
@@ -207,7 +218,7 @@ pub struct PatternFillInfo {
 }
 
 /// 도형 렌더링 스타일
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShapeStyle {
     /// 채우기 색상 (None이면 채우기 없음)
     pub fill_color: Option<ColorRef>,
@@ -226,7 +237,7 @@ pub struct ShapeStyle {
 }
 
 /// 도형 그림자 스타일
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShadowStyle {
     /// 그림자 종류 (1~8)
     pub shadow_type: u32,
@@ -255,7 +266,7 @@ impl Default for ShapeStyle {
 }
 
 /// 그라데이션 채우기 렌더링 정보
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct GradientFillInfo {
     /// 유형 (1: 줄무늬/선형, 2: 원형, 3: 원뿔형, 4: 사각형)
     pub gradient_type: i16,
@@ -272,7 +283,7 @@ pub struct GradientFillInfo {
 }
 
 /// 선 렌더링 스타일
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct LineStyle {
     /// 선 색상
     pub color: ColorRef,
@@ -295,7 +306,7 @@ pub struct LineStyle {
 }
 
 /// 테두리 점선 종류
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum StrokeDash {
     #[default]
     Solid,
@@ -306,7 +317,7 @@ pub enum StrokeDash {
 }
 
 /// 선 렌더링 종류 (이중선/삼중선)
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum LineRenderType {
     #[default]
     Single,
@@ -321,7 +332,7 @@ pub enum LineRenderType {
 }
 
 /// 화살표 스타일
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub enum ArrowStyle {
     #[default]
     None,
@@ -344,7 +355,7 @@ pub enum ArrowStyle {
 }
 
 /// 패스 커맨드 (벡터 도형용)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub enum PathCommand {
     MoveTo(f64, f64),
     LineTo(f64, f64),
@@ -539,7 +550,7 @@ pub fn px_to_hwpunit(px: f64, dpi: f64) -> i32 {
 pub fn generic_fallback(font_family: &str) -> &'static str {
     if font_family.is_empty() {
         // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif";
+        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
     }
     // 고정폭 키워드
     let lower = font_family.to_ascii_lowercase();
@@ -554,18 +565,23 @@ pub fn generic_fallback(font_family: &str) -> &'static str {
     if font_family.contains("바탕") || font_family.contains("명조")
         || font_family.contains("궁서")
     {
-        // Serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-        return "'Batang','바탕','AppleMyungjo','Noto Serif KR',serif";
+        // Serif: Windows → macOS(Bold 보유 우선) → macOS 기본 → Android → 오픈소스 → 리눅스 시스템 → generic
+        // Nanum Myeongjo 는 macOS 10.9+ 기본 설치이며 Bold variant 보유.
+        // AppleMyungjo 보다 앞에 두어야 macOS Chrome 에서 CJK 글리프 bold 매칭 성공.
+        // 'Source Han Serif K Old Hangul' (Task #528): @font-face unicode-range 가 옛한글
+        // 영역 (U+1100-11FF, U+A960-A97F, U+D7B0-D7FF) 만 매칭하므로 일반 한글에 영향 없음.
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
     }
     // 세리프 키워드 (영문)
     if lower.contains("times") || lower.contains("hymjre")
         || lower.contains("palatino") || lower.contains("georgia")
         || lower.contains("batang") || lower.contains("gungsuh")
     {
-        return "'Batang','바탕','AppleMyungjo','Noto Serif KR',serif";
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
     }
     // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif"
+    // 'Source Han Serif K Old Hangul' (Task #528): unicode-range 옛한글 자모 영역 한정
+    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif"
 }
 
 // ============================================================
@@ -932,8 +948,8 @@ mod tests {
 
     #[test]
     fn test_generic_fallback() {
-        let serif = "'Batang','바탕','AppleMyungjo','Noto Serif KR',serif";
-        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard',sans-serif";
+        let serif = "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
+        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
         let mono = "'GulimChe','굴림체','D2Coding','Noto Sans Mono',monospace";
         // 세리프 계열
         assert_eq!(generic_fallback("함초롬바탕"), serif);

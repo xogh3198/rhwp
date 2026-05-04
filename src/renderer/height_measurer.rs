@@ -107,6 +107,13 @@ pub struct MeasuredTable {
     pub cells: Vec<MeasuredCell>,
     /// 표 쪽 나눔 설정
     pub page_break: TablePageBreak,
+    /// 각 행이 속한 rowspan 묶음 블록의 시작 행 (Task #398).
+    /// 단일 행 블록(rowspan=1만 포함)이면 row_block_start[r] == r.
+    /// 길이는 row_heights.len()와 동일. 빈 vec이면 모든 행이 단일 블록으로 간주.
+    pub row_block_start: Vec<usize>,
+    /// 각 행이 속한 rowspan 묶음 블록의 종료 행 (exclusive, Task #398).
+    /// 단일 행 블록이면 row_block_end[r] == r + 1.
+    pub row_block_end: Vec<usize>,
 }
 
 /// 셀의 줄 단위 측정 정보 (행 내부 분할용)
@@ -428,18 +435,22 @@ impl HeightMeasurer {
         depth: usize,
     ) -> MeasuredTable {
         if depth >= Self::MAX_NESTED_DEPTH {
+            let rc = table.row_count as usize;
+            let (rbs, rbe) = compute_row_blocks(table, rc);
             return MeasuredTable {
                 para_index,
                 control_index,
                 total_height: 0.0,
-                row_heights: vec![0.0; table.row_count as usize],
+                row_heights: vec![0.0; rc],
                 caption_height: 0.0,
                 cell_spacing: 0.0,
-                cumulative_heights: vec![0.0; table.row_count as usize + 1],
+                cumulative_heights: vec![0.0; rc + 1],
                 repeat_header: false,
                 has_header_cells: false,
                 cells: Vec::new(),
                 page_break: crate::model::table::TablePageBreak::None,
+                row_block_start: rbs,
+                row_block_end: rbe,
             };
         }
         // 1x1 래퍼 표 감지: 내부 표의 높이를 직접 측정
@@ -575,7 +586,24 @@ impl HeightMeasurer {
                 };
 
                 // 패딩 포함 총 필요 높이
-                let required_height = content_height + pad_top + pad_bottom;
+                // [Task #501] cell.padding 이 IR cell.height 의 절반을 초과하는 비정상
+                // 케이스 (mel-001 p2 셀[21]: cell.h=1280 HU, pad.top+bottom=3400 HU) 가드:
+                // 비정상 padding 이 row_heights 를 확장하면 TAC 표 비례 축소가 모든 행에
+                // 영향. content_height 가 IR cell.height 안에 들어가면 IR 권위 우선.
+                let total_pad = pad_top + pad_bottom;
+                let cell_h_px = if cell.height < 0x80000000 {
+                    hwpunit_to_px(cell.height as i32, self.dpi)
+                } else {
+                    0.0
+                };
+                let required_height = if cell_h_px > 0.0
+                    && total_pad > cell_h_px * 0.5
+                    && content_height <= cell_h_px
+                {
+                    cell_h_px
+                } else {
+                    content_height + total_pad
+                };
                 if required_height > row_heights[r] {
                     row_heights[r] = required_height;
                 }
@@ -875,6 +903,7 @@ impl HeightMeasurer {
             }
         }
 
+        let (row_block_start, row_block_end) = compute_row_blocks(table, row_heights.len());
         MeasuredTable {
             para_index,
             control_index,
@@ -889,6 +918,8 @@ impl HeightMeasurer {
                 .any(|c| c.is_header),
             cells: measured_cells,
             page_break: table.page_break,
+            row_block_start,
+            row_block_end,
         }
     }
 
@@ -1197,6 +1228,117 @@ impl MeasuredTable {
         let diff = self.cumulative_heights[end_row] - self.cumulative_heights[start_row];
         if start_row > 0 { diff - self.cell_spacing } else { diff }
     }
+
+    /// 주어진 행이 속한 rowspan 묶음 블록 (start, end_exclusive, height) 반환 (Task #398).
+    /// 단일 행 블록(rowspan=1만 포함)이면 (row, row+1, row_heights[row]) 반환.
+    /// row가 범위를 벗어나거나 row_block_* 가 비어있으면 단일 행으로 처리.
+    pub fn row_block_for(&self, row: usize) -> (usize, usize, f64) {
+        let rc = self.row_heights.len();
+        if row >= rc {
+            return (row, row, 0.0);
+        }
+        let start = self.row_block_start.get(row).copied().unwrap_or(row);
+        let end = self.row_block_end.get(row).copied().unwrap_or(row + 1);
+        // 방어적 보정: 잘못된 데이터 시 단일 행으로
+        let start = start.min(row);
+        let end = end.max(row + 1).min(rc);
+        let h = self.range_height(start, end);
+        (start, end, h)
+    }
+
+    /// 종료 행 후보가 *보호 대상* rowspan 묶음 블록 중간이면 블록 시작 행으로 후퇴.
+    /// 블록 크기가 BLOCK_UNIT_MAX_ROWS (=3) 초과인 큰 rowspan 묶음은 행 단위 분할 허용 (Task #398 v2).
+    /// [Task #474] RowBreak 표는 행 경계 분할이 명시 정책이라 보호 비적용.
+    pub fn snap_to_block_boundary(&self, end_row: usize) -> usize {
+        let rc = self.row_heights.len();
+        if end_row >= rc {
+            return end_row.min(rc);
+        }
+        // [Task #474] RowBreak 표는 보호 블록 정책 비적용 (HWP 행 경계 분할 정책 정합)
+        if self.allows_row_break_split() {
+            return end_row;
+        }
+        let block_start = self.row_block_start.get(end_row).copied().unwrap_or(end_row);
+        let block_end = self.row_block_end.get(end_row).copied().unwrap_or(end_row + 1);
+        if end_row == block_start {
+            return end_row;
+        }
+        let block_size = block_end.saturating_sub(block_start);
+        if block_size <= BLOCK_UNIT_MAX_ROWS {
+            block_start
+        } else {
+            end_row
+        }
+    }
+
+    /// [Task #474] 표 정책이 RowBreak 인지 확인. RowBreak 표는 행 경계 분할이
+    /// 명시 정책이므로 rowspan 보호 블록 정책 비적용 대상.
+    pub fn allows_row_break_split(&self) -> bool {
+        matches!(self.page_break, crate::model::table::TablePageBreak::RowBreak)
+    }
+}
+
+/// 블록 단위 보호 분할의 최대 rowspan. 이 값을 초과하는 큰 rowspan 묶음은
+/// 행 단위 분할을 허용하여 페이지 잔여 공간을 활용한다 (Task #398 v2, HanCom-compat).
+pub const BLOCK_UNIT_MAX_ROWS: usize = 3;
+
+/// 표의 모든 셀을 검사하여 rowspan 묶음 블록 경계를 산출한다 (Task #398).
+/// row_block_start[r] = r 행을 포함하는 셀들의 최소 시작 행
+/// row_block_end[r]   = r 행을 포함하는 셀들의 최대 종료 행 (exclusive)
+/// 겹치는 블록은 전이 폐포로 통합한다.
+fn compute_row_blocks(
+    table: &crate::model::table::Table,
+    row_count: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    if row_count == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut start: Vec<usize> = (0..row_count).collect();
+    let mut end: Vec<usize> = (1..=row_count).collect();
+    // 1단계: rowspan>1 셀로 블록 확장
+    for cell in &table.cells {
+        let r0 = cell.row as usize;
+        let rs = (cell.row_span as usize).max(1);
+        if r0 >= row_count { continue; }
+        let r1 = (r0 + rs).min(row_count);
+        for r in r0..r1 {
+            if start[r] > r0 { start[r] = r0; }
+            if end[r] < r1   { end[r] = r1; }
+        }
+    }
+    // 2단계: 전이 폐포 (겹치는 블록 통합)
+    loop {
+        let mut changed = false;
+        for r in 0..row_count {
+            let s = start[r];
+            let e = end[r];
+            // 같은 블록 내 모든 행의 start 최소값, end 최대값으로 평탄화
+            let mut new_s = s;
+            let mut new_e = e;
+            for r2 in s..e {
+                if start[r2] < new_s { new_s = start[r2]; }
+                if end[r2]   > new_e { new_e = end[r2];   }
+            }
+            if new_s != s || new_e != e {
+                start[r] = new_s;
+                end[r]   = new_e;
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    // 3단계: 같은 블록 내 모든 행이 동일 (start, end) 가지도록 정규화
+    let mut r = 0;
+    while r < row_count {
+        let s = start[r];
+        let e = end[r];
+        for r2 in s..e {
+            start[r2] = s;
+            end[r2]   = e;
+        }
+        r = e;
+    }
+    (start, end)
 }
 
 impl MeasuredSection {
@@ -1451,6 +1593,7 @@ mod tests {
             cumulative_heights: vec![0.0, 20.0, 55.0, 85.0], // 0, 20, 20+30+5, 55+25+5
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         let end = mt.find_break_row(200.0, 0, 20.0); // 200px 충분
         assert_eq!(end, 3); // 전부 fit
@@ -1466,6 +1609,7 @@ mod tests {
             cumulative_heights: vec![0.0, 20.0, 55.0, 85.0, 130.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         // avail=60, cursor=0, first_row_h=20
         // range(0,1)=20, range(0,2)=55, range(0,3)=85 > 60
@@ -1488,6 +1632,7 @@ mod tests {
             cumulative_heights: vec![0.0, 50.0, 85.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         let end = mt.find_break_row(30.0, 0, 50.0); // 30 < 50
         assert_eq!(end, 0); // 첫 행도 안 들어감
@@ -1502,6 +1647,7 @@ mod tests {
             cumulative_heights: vec![0.0, 20.0, 55.0, 85.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         // range(0,0) = 0
         assert_eq!(mt.range_height(0, 0), 0.0);
@@ -1527,6 +1673,7 @@ mod tests {
             cumulative_heights: vec![0.0, 50.0, 85.0, 115.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         // avail=60, effective_first=50 → end=1 (range(0,1)=50, range(0,2)=85>60)
         let end1 = mt.find_break_row(60.0, 0, 50.0);
@@ -1547,6 +1694,7 @@ mod tests {
             cumulative_heights: vec![0.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         assert_eq!(mt.find_break_row(100.0, 0, 0.0), 0);
         assert_eq!(mt.range_height(0, 0), 0.0);
@@ -1561,8 +1709,194 @@ mod tests {
             cumulative_heights: vec![0.0, 50.0],
             repeat_header: false, has_header_cells: false,
             cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
         };
         assert_eq!(mt.find_break_row(100.0, 0, 50.0), 1); // fit
         assert_eq!(mt.find_break_row(30.0, 0, 50.0), 0); // doesn't fit
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Task #398: rowspan 묶음 블록 테스트
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn make_table_with_cells(row_count: u16, col_count: u16, cells: Vec<crate::model::table::Cell>)
+        -> crate::model::table::Table
+    {
+        crate::model::table::Table {
+            row_count, col_count, cells,
+            ..Default::default()
+        }
+    }
+
+    fn cell_rs(row: u16, col: u16, row_span: u16) -> crate::model::table::Cell {
+        crate::model::table::Cell {
+            row, col, row_span,
+            col_span: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_compute_row_blocks_all_single() {
+        // 모든 셀 rowspan=1 → 각 행이 자기 자신만 포함하는 블록
+        let table = make_table_with_cells(3, 2, vec![
+            cell_rs(0, 0, 1), cell_rs(0, 1, 1),
+            cell_rs(1, 0, 1), cell_rs(1, 1, 1),
+            cell_rs(2, 0, 1), cell_rs(2, 1, 1),
+        ]);
+        let (s, e) = compute_row_blocks(&table, 3);
+        assert_eq!(s, vec![0, 1, 2]);
+        assert_eq!(e, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_compute_row_blocks_rs2_at_row0() {
+        // 행 0에 rs=2 셀 → 블록 0~2
+        let table = make_table_with_cells(3, 2, vec![
+            cell_rs(0, 0, 1), cell_rs(0, 1, 2), // rs=2
+            cell_rs(1, 0, 1),
+            cell_rs(2, 0, 1), cell_rs(2, 1, 1),
+        ]);
+        let (s, e) = compute_row_blocks(&table, 3);
+        assert_eq!(s, vec![0, 0, 2]);
+        assert_eq!(e, vec![2, 2, 3]);
+    }
+
+    #[test]
+    fn test_compute_row_blocks_overlapping() {
+        // 셀 A: rows 0~2, 셀 B: rows 1~3 → 통합 블록 0~3
+        let table = make_table_with_cells(4, 3, vec![
+            cell_rs(0, 0, 3), // rows 0,1,2
+            cell_rs(1, 1, 3), // rows 1,2,3
+            cell_rs(0, 2, 1),
+            cell_rs(3, 0, 1),
+        ]);
+        let (s, e) = compute_row_blocks(&table, 4);
+        assert_eq!(s, vec![0, 0, 0, 0]);
+        assert_eq!(e, vec![4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn test_compute_row_blocks_disjoint() {
+        // 비인접 rowspan은 별개 블록
+        let table = make_table_with_cells(5, 1, vec![
+            cell_rs(0, 0, 2), // rows 0~1
+            cell_rs(2, 0, 1),
+            cell_rs(3, 0, 2), // rows 3~4
+        ]);
+        let (s, e) = compute_row_blocks(&table, 5);
+        assert_eq!(s, vec![0, 0, 2, 3, 3]);
+        assert_eq!(e, vec![2, 2, 3, 5, 5]);
+    }
+
+    #[test]
+    fn test_row_block_for_basic() {
+        // 행 0+1을 묶는 rs=2 셀
+        let mt = MeasuredTable {
+            para_index: 0, control_index: 0, total_height: 100.0,
+            row_heights: vec![20.0, 30.0, 25.0],
+            caption_height: 0.0, cell_spacing: 5.0,
+            cumulative_heights: vec![0.0, 20.0, 55.0, 85.0],
+            repeat_header: false, has_header_cells: false,
+            cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![0, 0, 2], row_block_end: vec![2, 2, 3],
+        };
+        // 행 0: 블록 (0, 2, h=20+30+5=55)
+        let (s, e, h) = mt.row_block_for(0);
+        assert_eq!((s, e), (0, 2));
+        assert!((h - 55.0).abs() < 0.001);
+        // 행 1: 같은 블록 (0, 2)
+        let (s, e, h) = mt.row_block_for(1);
+        assert_eq!((s, e), (0, 2));
+        assert!((h - 55.0).abs() < 0.001);
+        // 행 2: 단일 블록 (2, 3, h=25)
+        let (s, e, h) = mt.row_block_for(2);
+        assert_eq!((s, e), (2, 3));
+        assert!((h - 25.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_row_block_for_empty_metadata() {
+        // row_block_* 비어있으면 단일 행으로 처리
+        let mt = MeasuredTable {
+            para_index: 0, control_index: 0, total_height: 50.0,
+            row_heights: vec![20.0, 30.0],
+            caption_height: 0.0, cell_spacing: 5.0,
+            cumulative_heights: vec![0.0, 20.0, 55.0],
+            repeat_header: false, has_header_cells: false,
+            cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
+        };
+        let (s, e, h) = mt.row_block_for(0);
+        assert_eq!((s, e), (0, 1));
+        assert!((h - 20.0).abs() < 0.001);
+        let (s, e, h) = mt.row_block_for(1);
+        assert_eq!((s, e), (1, 2));
+        assert!((h - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_snap_to_block_boundary() {
+        // 블록 0~2, 단일 행 2, 블록 3~4 (행 3+4)
+        let mt = MeasuredTable {
+            para_index: 0, control_index: 0, total_height: 100.0,
+            row_heights: vec![10.0, 10.0, 10.0, 10.0, 10.0],
+            caption_height: 0.0, cell_spacing: 0.0,
+            cumulative_heights: vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+            repeat_header: false, has_header_cells: false,
+            cells: vec![], page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![0, 0, 2, 3, 3],
+            row_block_end:   vec![2, 2, 3, 5, 5],
+        };
+        // end_row=0: 블록 시작 → 0
+        assert_eq!(mt.snap_to_block_boundary(0), 0);
+        // end_row=1: 블록 0~2 중간 → 0으로 후퇴
+        assert_eq!(mt.snap_to_block_boundary(1), 0);
+        // end_row=2: 블록 시작 (단일 행 2) → 2
+        assert_eq!(mt.snap_to_block_boundary(2), 2);
+        // end_row=3: 블록 시작 → 3
+        assert_eq!(mt.snap_to_block_boundary(3), 3);
+        // end_row=4: 블록 3~5 중간 → 3으로 후퇴
+        assert_eq!(mt.snap_to_block_boundary(4), 3);
+        // end_row=5: 행 범위 끝 → 5 (snap 없음)
+        assert_eq!(mt.snap_to_block_boundary(5), 5);
+    }
+
+    #[test]
+    fn test_snap_to_block_boundary_row_break_skipped() {
+        // [Task #474] RowBreak 표는 보호 블록 정책 비적용 — end_row 그대로 반환
+        let mt = MeasuredTable {
+            para_index: 0, control_index: 0, total_height: 100.0,
+            row_heights: vec![10.0, 10.0, 10.0, 10.0, 10.0],
+            caption_height: 0.0, cell_spacing: 0.0,
+            cumulative_heights: vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+            repeat_header: false, has_header_cells: false,
+            cells: vec![],
+            page_break: crate::model::table::TablePageBreak::RowBreak,
+            row_block_start: vec![0, 0, 2, 3, 3],
+            row_block_end:   vec![2, 2, 3, 5, 5],
+        };
+        // None 정책에서는 end_row=1 → 0 으로 후퇴, RowBreak 에서는 1 그대로
+        assert_eq!(mt.snap_to_block_boundary(1), 1);
+        // None 정책에서는 end_row=4 → 3 으로 후퇴, RowBreak 에서는 4 그대로
+        assert_eq!(mt.snap_to_block_boundary(4), 4);
+    }
+
+    #[test]
+    fn test_allows_row_break_split() {
+        // [Task #474] page_break 정책 별 RowBreak 인지 확인
+        let mut mt = MeasuredTable {
+            para_index: 0, control_index: 0, total_height: 0.0,
+            row_heights: vec![], caption_height: 0.0, cell_spacing: 0.0,
+            cumulative_heights: vec![0.0], repeat_header: false,
+            has_header_cells: false, cells: vec![],
+            page_break: crate::model::table::TablePageBreak::None,
+            row_block_start: vec![], row_block_end: vec![],
+        };
+        assert!(!mt.allows_row_break_split());
+        mt.page_break = crate::model::table::TablePageBreak::CellBreak;
+        assert!(!mt.allows_row_break_split());
+        mt.page_break = crate::model::table::TablePageBreak::RowBreak;
+        assert!(mt.allows_row_break_split());
     }
 }

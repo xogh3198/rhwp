@@ -2,6 +2,186 @@
 
 이 프로젝트의 주요 변경 사항을 기록합니다.
 
+## [0.7.9] — 2026-05-01
+
+> v0.7.8 후속 사이클 — Task #501 (cell.padding 한컴 방어 로직) + PR #428/#494/#478/#498 cherry-pick + 외부 기여자 4명 흡수
+
+### 회귀 정정 (메인테이너)
+
+- **Task #501 — mel-001.hwp 2쪽 표 셀 높이 처리 회귀** (closes #501)
+  - 본질: HWP 셀 IR 의 `cell.padding.top + bottom > cell.height` 인 비정상 케이스 (mel-001 셀[21] r=2 c=2 "현 원": pad=(141,141,1700,1700), cell.h=1280 HU). HWPX `hasMargin="0"` 명시 정합.
+  - 회귀 origin: Task #347 의 `prefer_cell_axis` 가드가 비정상 padding 도 cell 우선 적용 → row_heights 거대 → TAC 표 비례 축소 (scale 0.45) → 행 12~20px 축소 + 셀 진입 결함.
+  - 정정: `resolve_cell_padding` 끝에 **한컴 자체 방어 로직 모방** 가드 추가 — pad_top + pad_bottom > cell.height 면 cell.height 의 절반까지 비례 축소. `measure_table_impl` 1-b단계도 동일 안전망.
+  - 작업지시자 통찰: *"이런 경우 한컴은 자체 방어로직으로 처리한다면?"* — Task #347 가드 (KTX 목차 R=1417 HU 정합) 보존 + 한컴 동작 모방 가드 추가
+  - 트러블슈팅 + 위키 ([HWP 셀 Padding 방어 로직](https://github.com/edwardkim/rhwp/wiki/HWP-%EC%85%80-Padding-%EB%B0%A9%EC%96%B4-%EB%A1%9C%EC%A7%81)) 작성
+
+### 외부 PR cherry-pick (3 건 / 17 commits)
+
+- **PR #428 그룹 내 그림(Picture) 직렬화 구현** (by [@oksure](https://github.com/oksure))
+  - `serialize_group_child` 의 `ShapeObject::Picture` 분기 (빈 TODO) 구현 — 그룹 내 그림이 포함된 HWP 저장 시 그림 데이터 유실 결함 정정
+  - SHAPE_COMPONENT + SHAPE_COMPONENT_PICTURE 레코드 추가 (Chart/OLE 자식과 동일 패턴) + 매직 상수 정리 (`tags::SHAPE_PICTURE_ID`)
+
+- **PR #494 Paragraph::utf16_pos_to_char_idx 외부 노출** (#484, by [@DanMeon](https://github.com/DanMeon))
+  - PR #405 와 같은 결의 외부 binding 작업 — `helpers::utf16_pos_to_char_idx` (pub(crate)) 의 알고리즘을 `Paragraph::utf16_pos_to_char_idx(&self, utf16_pos: u32) -> usize` (pub) 으로 캡슐화
+  - 단위 테스트 6건 추가, semver MINOR 영역 (+1 method, 알고리즘 변경 없음)
+
+- **PR #478 Layout 정합 + 수식 정정 합본** (by [@planet6897](https://github.com/planet6897))
+  - 9 Task / 97 commits 누적 PR 중 페이지 레이아웃 무관 영역 **7 Task / 10 commits** 분리 cherry-pick (5 단계 머지)
+  - **#488** (수식 토크나이저 폰트 스타일 prefix 분리 + svg/canvas 렌더러 italic honor) — 단위 테스트 14건 추가
+  - **#490** (빈 텍스트 + TAC 수식 셀 alignment 적용) — exam_science p1 셀 7/11 28/36 수식 중앙 정렬
+  - **#483** (각주 multi-paragraph line_spacing 정합 + trailing line_spacing follow-up)
+  - **#489** (Picture+Square wrap 호스트 paragraph 텍스트 LINE_SEG cs/sw 적용)
+  - **#495** (셀 paragraph 인라인 Shape 분기 가드 — 부분 정정, 잔존 [이슈 #502](https://github.com/edwardkim/rhwp/issues/502) 분리)
+  - **#480** (wrap=Square 표 paragraph margin x 좌표 반영)
+  - **#476** (PartialParagraph 인라인 Shape 페이지 라우팅, +881/-4)
+  - 미흡수: #479 (paragraph trailing line_spacing/HWP vpos) — 한컴 2020 정답지 시각 판정 필수, [이슈 #503](https://github.com/edwardkim/rhwp/issues/503) 분리
+
+### 회귀 검증 인프라 (외부 기여)
+
+- **PR #498 Canvas visual diff 파이프라인** (relates #364, by [@seo-rii](https://github.com/seo-rii))
+  - PR #456 (P2 PageLayerTree replay 전환) 후속 P3 검증 레이어 — rhwp-studio E2E 에 legacy Canvas vs PageLayerTree replay Canvas **픽셀 diff 자동 검증** + GitHub Actions Render Diff workflow 추가
+  - 7 commits 분리 (test + diagnostics + docs + CI runner + 보안 hardening 3건)
+  - 변경 영역: JS E2E + CI workflow + 문서 + Vite 설정 (Rust 변경 0)
+  - 기본 fixture 3개 (KTX/biz_plan/tac-case-001) 모두 0 diff 확인
+
+### 분리된 후속 이슈
+
+- [#502](https://github.com/edwardkim/rhwp/issues/502) — 문단 내 글상자 TextRun 처리 (Task #495 잔존 결함)
+- [#503](https://github.com/edwardkim/rhwp/issues/503) — Task #479 본질 정정 흡수 (한컴 2020 시각 판정 필수)
+
+### 위키 정합
+
+- [HWP 셀 Padding 방어 로직](https://github.com/edwardkim/rhwp/wiki/HWP-%EC%85%80-Padding-%EB%B0%A9%EC%96%B4-%EB%A1%9C%EC%A7%81) 신규
+- [한컴 PDF 환경 의존성](https://github.com/edwardkim/rhwp/wiki/%ED%95%9C%EC%BB%B4-PDF-%ED%99%98%EA%B2%BD-%EC%9D%98%EC%A1%B4%EC%84%B1) 정황 IV 추가 (21_언어_기출 한컴 2020 = rhwp 정답)
+
+### 검증
+
+- cargo test --lib 1086 → **1102 passed**
+- cargo test --test svg_snapshot 6/6, issue_418 1/1, issue_501 PASS (신규 통합 테스트)
+- cargo clippy --lib -- -D warnings 0건
+- WASM 4,206,487 bytes (Task #501) → 4,202,430 bytes (PR #478 5차 후) → 4,211,280 bytes (4차 #480 후)
+
+## [0.7.8] — 2026-04-29
+
+> v0.7.7 후속 사이클 — 외부 컨트리뷰터 다수 + 메인테이너 회귀 정정 + 위키/README 정비
+
+### 외부 PR cherry-pick (15 건)
+
+라이브러리 본질 정정 (조판 / 페이지네이션 / 직렬화):
+
+- **PR #391 다단 섹션 누적 공식 회귀 정정** (#391, by [@planet6897](https://github.com/planet6897))
+  - `src/renderer/typeset.rs` 누적 공식을 `col_count` 로 분기 — 단단 → `total_height`, 다단 → `height_for_fit` (trailing_ls 인플레이션 차단)
+  - exam_eng (2단): 11 → **8 페이지**, 단독 1-item 단 (p3/p5/p7) 해소
+
+- **PR #396 수식 렌더링 개선** (#174, #175, by [@oksure](https://github.com/oksure))
+  - 인라인 수식 높이를 `eq.common.height` (HWP 권위값) 기준으로 설정 + X/Y 스케일링 동시 적용
+  - 수식 내 CJK 문자 이탤릭 / 너비 보정 비적용 — CASES 한글 행 겹침 정정
+  - 메인테이너 후속 정정 3건 (Canvas 분수선 y / Equation 스케일 / Limit fi=fs)
+
+- **PR #395 그림 밝기/대비 효과 SVG 반영** (#150, by [@oksure](https://github.com/oksure))
+
+- **PR #397 수식 ATOP 파싱 및 렌더링 보정** (by [@cskwork](https://github.com/cskwork))
+  - **본 저장소 첫 외부 컨트리뷰터** — `EqNode::Atop` AST 파싱 + 분수선 없는 위/아래 배치 (HWP 의 ATOP / OVER 의미 분리)
+
+- **PR #400 HWPX 수식 직렬화 보존** (#286, by [@cskwork](https://github.com/cskwork))
+  - `render_paragraph_parts` 의 controls 무시 정황 정정 + parser XML entity 복원
+  - 한컴 한글 2020 정상 열람 + PDF 일치 확인 (한컴 origin hwp 라운드트립 회귀 commit `ecd7d9a` 추가)
+
+- **PR #401 v2 표 페이지 분할 rowspan>1 셀 분할 단위** (#398, by [@planet6897](https://github.com/planet6897))
+  - `BLOCK_UNIT_MAX_ROWS=3` 임계 — 작은 블록 (≤3 행) 만 보호, 큰 rowspan (≥4 행) 행 단위 분할 허용 (HanCom 호환)
+  - synam-001.hwp 5페이지 회귀 정정 (35→37→**35** 페이지)
+
+- **PR #406 동일 문단 inline TAC 그림 페이지네이션 정정** (#402, by [@planet6897](https://github.com/planet6897))
+  - 같은 paragraph 의 두 번째 inline 그림이 첫 번째와 같은 y 좌표에 그려져 겹침/오버플로 발생하던 문제 정정
+  - 27→30 페이지 (분할 정상화)
+
+- **PR #408 heading-orphan vpos 기반 보정** (#404, by [@planet6897](https://github.com/planet6897))
+  - vpos 기반 5 조건 AND trigger (current fit + vpos overflow + next substantial + next 못 fit + single column non-wrap) — vpos overflow 41건 중 1건만 진짜 orphan
+  - 9쪽 pi=83 헤딩 → 10쪽으로 push, 후속 표와 함께 배치
+
+- **PR #410 TopAndBottom Picture vert=Para chart 정정 + atomic TAC top-fit** (#409, by [@planet6897](https://github.com/planet6897))
+  - v1: `prev_has_overlay_shape` 가드 확장 (Picture + TopAndBottom + vert=Para)
+  - v2: `typeset_section` controls 루프 chart 높이 누적
+  - v3: `typeset_paragraph` atomic TAC top-fit 시멘틱 (60px tolerance)
+
+- **PR #415 Task #352 dash 시퀀스 Justify 폭 부풀림 정정** (#352, by [@planet6897](https://github.com/planet6897))
+  - dash leader elastic Justify 분배 (PDF 모방), exam_eng Q32 dash advance 12.11 → 7.06 px
+
+- **PR #424 다단 우측 단 단행 문단 줄간격 누락 정정 (vpos 보정 anchor)** (#412, by [@planet6897](https://github.com/planet6897))
+  - layout.rs vpos 보정 공식 정정 — `col_anchor_y` 도입 (body_wide_reserved 푸시 직후 anchor 보존), `curr_first_vpos` 우선 사용, page_path/lazy_path 분리
+  - exam_eng p1 우측 단 item 7 ①~⑤ 15.33→**22.55px 균일**, 좌측 단 item 1 catch-up 28.56→21.89
+
+- **PR #427 SvgRenderer defs 중복 방지 HashSet 통합** (#423, by [@oksure](https://github.com/oksure))
+  - `arrow_marker_ids: HashSet<String>` → 범용 `defs_ids: HashSet<String>` 통합, O(n)→O(1)
+
+- **PR #434 그림 자동 크롭 (FitToSize+crop) 공식 교정 + 테두리 inner padding** (#430, by [@planet6897](https://github.com/planet6897))
+  - svg.rs / web_canvas.rs 의 crop 스케일 공식 정정 (`cr/img_w` → `original_size_hu/img_size_px`) + 헬퍼 `compute_image_crop_src` 추출 (SVG/Canvas 단일 진실 원천)
+  - 별도 fix: 테두리 문단 inner padding (텍스트가 테두리에 붙는 문제)
+
+API 추가 / 도구:
+
+- **PR #405 `Paragraph::control_text_positions` 추가** (#390, by [@DanMeon](https://github.com/DanMeon))
+  - 외부 binding 노출용 API 리팩토링
+
+- **PR #411 `editor.exportHwp()` API 추가** (by [@ggoban](https://github.com/ggoban))
+  - 신규 컨트리뷰터 첫 PR — iframe wrapper `@rhwp/editor` 에 exportHwp() 노출
+
+- **PR #413 rhwp-studio PWA support** (#383, by [@dyjung150605](https://github.com/dyjung150605))
+  - 신규 컨트리뷰터 첫 PR — vite-plugin-pwa, manifest scope `/rhwp/`, icon 192/512/maskable, registerType=autoUpdate, WASM precache
+
+- **PR #419 PageLayerTree generation API 도입** (#364, by [@seo-rii](https://github.com/seo-rii))
+  - `paint` 모듈 신규 (2,376 lines, builder/json/layer_tree/paint_op) — PageRenderTree → PageLayerTree 변환
+  - opt-in transition adapter (`svg_layer.rs`, `RHWP_RENDER_PATH=layer-svg`)
+  - 기존 5 렌더러 파일 변경 0 라인, 광범위 309 페이지 SVG 100% byte 동일 (피델리티 분석 보고서)
+
+### 메인테이너 작업 (3 건)
+
+- **Task #394 셀 진입 시 투명선 자동 ON 로직 비활성화** (#394)
+  - input-handler.ts 5 영역 주석 처리 — 한컴 출력 정합
+
+- **Task #416 `find_bin_data` 가드 결함 정정** (#416)
+  - `c.id == bin_data_id` 가드 제거 — `c.id` 는 storage_id, bin_data_id 는 인덱스. sparse id 범위 분기 (HWPX 차트 60000+N 보존). 단위 테스트 7건 추가
+
+- **Task #418 `hwpspec.hwp` p20 빈 문단 + TAC Picture 이중 emit 정정** (#418)
+  - Task #376 정정 commit 이 devel 미머지 (close 됐지만 임시 브랜치에만 존재) → 동일 결함 재발
+  - paragraph_layout 의 set_inline_shape_position + layout.rs::layout_shape_item 의 already_registered 가드 추가
+  - 신규 메모리 (close 시 commit devel 머지 검증) + 트러블슈팅 신설
+
+### 정비 / 문서
+
+- **위키 페이지 [한컴 PDF 환경 의존성](https://github.com/edwardkim/rhwp/wiki/한컴-PDF-환경-의존성) 보강**
+  - "발견 정황 II (PR #434 / 이슈 #430)" 섹션 추가 — 한컴 2010 ↔ 2020 ↔ 한컴독스 가 같은 hwp 를 다르게 조판하는 정황. 단일 한컴 정답지 가정의 한계 재확인.
+  - rhwp 의 현재 출력이 시험지 조판자 의도에 더 부합 가능성 (원본 JPEG "(A 형)" 잔재 보존)
+
+- **README.md / README_EN.md 보강**
+  - Contributing 섹션에 "한컴 PDF 는 정답지가 아닙니다" 항목 추가
+  - 신규 "위키 자료 (Wiki Resources)" 서브섹션 (위키 9개 페이지 링크)
+
+- **samples 정답지 자료 추가** — 모든 컨트리뷰터와 fork 사용자 공유
+  - `samples/2010-exam_kor.pdf` (한컴 2010, 4.57 MB)
+  - `samples/2020-exam_kor.pdf` (한컴 2020, 4.57 MB)
+  - `samples/hancomdocs-exam_kor.pdf` (한컴독스, 6.05 MB)
+  - `samples/복학원서.pdf` (이슈 #421 한컴 정답지)
+  - `samples/synam-001.hwp` (PR #401 회귀 검증)
+  - `samples/atop-equation-01.hwp` (PR #397 시각 판정)
+
+### 검증
+
+- `cargo test --lib`: **1066 passed** (1008 → +58, 회귀 0건)
+- `cargo test --test svg_snapshot`: 6/6 passed
+- `cargo test --test issue_418`: 1/1 passed (Task #418 회귀 보존)
+- `cargo clippy --lib -- -D warnings`: 0건
+- WASM 빌드: 4,182,395 bytes (변동 +47 KB)
+- 광범위 byte 비교: 10 샘플 / 309 페이지 SVG 회귀 검증 (PR 별 검증 게이트)
+- 작업지시자 SVG + Canvas 양 경로 시각 판정 (PR #401 v2 / #406 / #408 / #410 / #415 / #424 / #434)
+
+### 외부 기여자 감사
+
+본 사이클 외부 기여자 (가나다순):
+[@cskwork](https://github.com/cskwork), [@DanMeon](https://github.com/DanMeon), [@dyjung150605](https://github.com/dyjung150605), [@ggoban](https://github.com/ggoban), [@oksure](https://github.com/oksure), [@planet6897](https://github.com/planet6897), [@seo-rii](https://github.com/seo-rii)
+
+특히 [@cskwork](https://github.com/cskwork) 님은 **본 저장소 첫 외부 컨트리뷰터** 로 PR #397 / #400 두 건을 머지하셨고, [@planet6897](https://github.com/planet6897) 님은 본 사이클 외부 PR 의 다수 (8 건) 를 진단 + 정정해주셨습니다.
+
 ## [0.7.7] — 2026-04-27
 
 > v0.7.6 회귀 정정 사이클 (TypesetEngine default 전환 후 누락된 시멘틱 복원)

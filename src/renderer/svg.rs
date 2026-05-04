@@ -6,6 +6,24 @@
 use super::{Renderer, TextStyle, ShapeStyle, LineStyle, PathCommand, GradientFillInfo, PatternFillInfo, StrokeDash};
 use super::render_tree::{PageRenderTree, RenderNode, RenderNodeType, ImageNode, FormObjectNode, ShapeTransform, BoundingBox};
 use super::composer::{CharOverlapInfo, pua_to_display_text, decode_pua_overlap_number};
+use super::pua_oldhangul::map_pua_old_hangul;
+
+/// Hanyang-PUA 옛한글 코드포인트를 KS X 1026-1:2007 자모 시퀀스로 확장.
+/// PUA 가 없으면 원본 문자열 그대로 반환 (allocation 없음).
+fn expand_pua_old_hangul(text: &str) -> String {
+    if !text.chars().any(|ch| map_pua_old_hangul(ch).is_some()) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() * 2);
+    for ch in text.chars() {
+        if let Some(jamos) = map_pua_old_hangul(ch) {
+            out.extend(jamos.iter().copied());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 use crate::model::control::FormType;
 use super::layout::{compute_char_positions, split_into_clusters};
 use crate::model::style::{ImageFillMode, UnderlineType};
@@ -57,8 +75,8 @@ pub struct SvgRenderer {
     overlay_skip_depth: u32,
     /// 디버그 오버레이용: 현재 페이지의 메인 섹션 인덱스 (-1이면 미설정)
     overlay_page_section: i32,
-    /// 생성된 화살표 마커 ID 집합 (중복 방지)
-    arrow_marker_ids: std::collections::HashSet<String>,
+    /// defs 내 중복 방지용 ID 집합 (화살표 마커, 이미지 효과 필터 등)
+    defs_ids: std::collections::HashSet<String>,
     /// 폰트 임베딩 모드
     pub font_embed_mode: FontEmbedMode,
     /// 추가 폰트 탐색 경로
@@ -120,7 +138,7 @@ impl SvgRenderer {
             overlay_vpos_resets: Vec::new(),
             overlay_skip_depth: 0,
             overlay_page_section: -1,
-            arrow_marker_ids: std::collections::HashSet::new(),
+            defs_ids: std::collections::HashSet::new(),
             font_embed_mode: FontEmbedMode::None,
             font_paths: Vec::new(),
             font_codepoints: std::collections::HashMap::new(),
@@ -329,10 +347,16 @@ impl SvgRenderer {
                 } else {
                     1.0
                 };
-                if (scale_x - 1.0).abs() > 0.01 {
+                let scale_y = if eq.layout_box.height > 0.0 && node.bbox.height > 0.0 {
+                    node.bbox.height / eq.layout_box.height
+                } else {
+                    1.0
+                };
+                let needs_scale = (scale_x - 1.0).abs() > 0.01 || (scale_y - 1.0).abs() > 0.01;
+                if needs_scale {
                     self.output.push_str(&format!(
-                        "<g transform=\"translate({},{}) scale({:.4},1)\">\n",
-                        node.bbox.x, node.bbox.y, scale_x,
+                        "<g transform=\"translate({},{}) scale({:.4},{:.4})\">\n",
+                        node.bbox.x, node.bbox.y, scale_x, scale_y,
                     ));
                 } else {
                     self.output.push_str(&format!(
@@ -703,10 +727,9 @@ impl SvgRenderer {
         let color_id = color.replace('#', "");
         let id = format!("mk-{}-{}-{}-{}", type_name, dir, color_id, arrow_size);
 
-        if self.arrow_marker_ids.contains(&id) {
+        if !self.defs_ids.insert(id.clone()) {
             return id;
         }
-        self.arrow_marker_ids.insert(id.clone());
 
         // HWP 화살표 크기 → 너비/길이 배율
         // arrow_size: 0=작은-작은, 1=작은-중간, 2=작은-큰,
@@ -1061,11 +1084,17 @@ impl SvgRenderer {
         if let Some(ref fid) = effect_filter_id {
             self.output.push_str(&format!("<g filter=\"url(#{})\">\n", fid));
         }
+        // 밝기/대비 → SVG 필터 래핑
+        let bc_filter_id = self.ensure_brightness_contrast_filter(img.brightness, img.contrast);
+        if let Some(ref fid) = bc_filter_id {
+            self.output.push_str(&format!("<g filter=\"url(#{})\">\n", fid));
+        }
 
         let mime_type = detect_image_mime_type(data);
 
         // WMF → SVG 변환 (브라우저는 WMF를 렌더링할 수 없으므로 SVG로 변환)
         // BMP → PNG 변환 (브라우저는 SVG <image> 내부의 data:image/bmp 미지원)
+        // PCX → PNG 변환 (브라우저는 PCX 포맷을 native 렌더링하지 못함, Task #514)
         let (render_data, render_mime): (std::borrow::Cow<[u8]>, &str) = if mime_type == "image/x-wmf" {
             match convert_wmf_to_svg(data) {
                 Some(svg_bytes) => (std::borrow::Cow::Owned(svg_bytes), "image/svg+xml"),
@@ -1073,6 +1102,11 @@ impl SvgRenderer {
             }
         } else if mime_type == "image/bmp" {
             match bmp_bytes_to_png_bytes(data) {
+                Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                None => (std::borrow::Cow::Borrowed(data), mime_type),
+            }
+        } else if mime_type == "image/x-pcx" {
+            match pcx_bytes_to_png_bytes(data) {
                 Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
                 None => (std::borrow::Cow::Borrowed(data), mime_type),
             }
@@ -1092,21 +1126,8 @@ impl SvgRenderer {
                     if let Some((img_w, img_h)) = parse_image_dimensions(&render_data) {
                         let img_w = img_w as f64;
                         let img_h = img_h as f64;
-                        // crop 좌표 → 원본 이미지 비율 (crop 좌표 / 안 자른 전체 crop 크기)
-                        // 안 자른 전체 crop 크기 ≈ 원본 px × (crop.right / img_w)
-                        // 즉 scale = crop.right / img_w (이 값이 ~75)
-                        let scale_x = cr as f64 / img_w;
-                        let scale_y = if ct == 0 && cl == 0 {
-                            // 전체 이미지의 scale은 right/width로 추정
-                            scale_x
-                        } else {
-                            cb as f64 / img_h // fallback
-                        };
-                        // 원본 px 좌표로 변환
-                        let src_x = cl as f64 / scale_x;
-                        let src_y = ct as f64 / scale_x;
-                        let src_w = (cr - cl) as f64 / scale_x;
-                        let src_h = (cb - ct) as f64 / scale_x;
+                        let (src_x, src_y, src_w, src_h) =
+                            compute_image_crop_src((cl, ct, cr, cb), img.original_size_hu, img_w, img_h);
                         // 전체 이미지 대비 잘림이 있는지 확인
                         let is_cropped = src_x > 0.5 || src_y > 0.5
                             || (src_w - img_w).abs() > 1.0 || (src_h - img_h).abs() > 1.0;
@@ -1158,6 +1179,9 @@ impl SvgRenderer {
             }
         }
 
+        if bc_filter_id.is_some() {
+            self.output.push_str("</g>\n");
+        }
         if effect_filter_id.is_some() {
             self.output.push_str("</g>\n");
         }
@@ -1202,11 +1226,44 @@ impl SvgRenderer {
                     0 0 0 1 0\"/></filter>\n",
             ),
         };
-        let def_str = def.to_string();
-        if !self.defs.iter().any(|d| d == &def_str) {
-            self.defs.push(def_str);
+        if self.defs_ids.insert(id.to_string()) {
+            self.defs.push(def.to_string());
         }
         Some(id.to_string())
+    }
+
+    /// 밝기/대비 조정용 SVG 필터를 defs에 보장하고 ID를 반환한다.
+    /// 둘 다 0이면 필터 불필요 → None 반환.
+    /// HWP 스펙은 brightness/contrast 를 -100..=100 으로 정의하므로 손상된 입력에 대비해 clamp 한다.
+    fn ensure_brightness_contrast_filter(&mut self, brightness: i8, contrast: i8) -> Option<String> {
+        let brightness = brightness.clamp(-100, 100);
+        let contrast = contrast.clamp(-100, 100);
+        if brightness == 0 && contrast == 0 {
+            return None;
+        }
+
+        let id = format!("rhwp-img-bc-b{}c{}", brightness, contrast);
+
+        // 밝기: intercept 오프셋으로 구현 (slope=1, intercept=brightness/100)
+        // 대비: slope 조정으로 구현 (slope=(100+contrast)/100, intercept=0.5-0.5*slope)
+        // 둘을 합성: slope=contrast_slope, intercept=contrast_intercept + brightness_offset
+        let b = brightness as f64 / 100.0;
+        let slope = (100.0 + contrast as f64) / 100.0;
+        let intercept = (0.5 - 0.5 * slope) + b;
+
+        let def = format!(
+            "<filter id=\"{id}\">\
+                <feComponentTransfer>\
+                    <feFuncR type=\"linear\" slope=\"{slope:.4}\" intercept=\"{intercept:.4}\"/>\
+                    <feFuncG type=\"linear\" slope=\"{slope:.4}\" intercept=\"{intercept:.4}\"/>\
+                    <feFuncB type=\"linear\" slope=\"{slope:.4}\" intercept=\"{intercept:.4}\"/>\
+                </feComponentTransfer>\
+            </filter>\n"
+        );
+        if self.defs_ids.insert(id.clone()) {
+            self.defs.push(def);
+        }
+        Some(id)
     }
 
     /// 이미지를 원래 크기로 지정 위치에 배치 (배치 모드)
@@ -1780,8 +1837,8 @@ impl Renderer for SvgRenderer {
         self.height = height;
         self.output.clear();
         self.defs.clear();
+        self.defs_ids.clear();
         self.gradient_counter = 0;
-        self.arrow_marker_ids.clear();
         self.overlay_para_bounds.clear();
         self.overlay_table_bounds.clear();
         self.overlay_vpos_resets.clear();
@@ -1814,10 +1871,16 @@ impl Renderer for SvgRenderer {
     }
 
     fn draw_text(&mut self, text: &str, x: f64, y: f64, style: &TextStyle) {
-        // PUA 문자(U+F000~F0FF, Wingdings 등 심볼 폰트)를 유니코드 표준 문자로 변환
-        let text = &text.chars().map(|ch| {
-            crate::renderer::layout::map_pua_bullet_char(ch)
-        }).collect::<String>();
+        // [Task #509] 한컴은 폰트 지정과 상관없이 PUA 를 자체 처리. 지정 폰트에 글리프
+        // 부재 시 한컴 내부 매핑이 발행. rhwp 도 동일 동작 모방 — 일반 텍스트도 PUA
+        // 변환 적용 (PR #251 정합). 매핑 표는 한컴 PDF 정답지 기준.
+        let text = &text
+            .chars()
+            .map(crate::renderer::layout::map_pua_bullet_char)
+            .collect::<String>();
+        // [Task #528] Hanyang-PUA 옛한글 → KS X 1026-1:2007 자모 시퀀스.
+        // 한/글 2010 이전 옛한글 PUA 인코딩을 표준 자모로 변환 (KTUG 매핑).
+        let text = &expand_pua_old_hangul(text);
 
         let color = color_to_svg(style.color);
         let font_size = if style.font_size > 0.0 { style.font_size } else { 12.0 };
@@ -1847,6 +1910,19 @@ impl Renderer for SvgRenderer {
         let char_positions = compute_char_positions(text, style);
         let clusters = split_into_clusters(text);
 
+        // 형광펜 배경 (CharShape.shade_color 기반 — web_canvas.rs와 동일 로직)
+        let shade_rgb = style.shade_color & 0x00FFFFFF;
+        if shade_rgb != 0x00FFFFFF && shade_rgb != 0 {
+            let text_width = *char_positions.last().unwrap_or(&0.0);
+            if text_width > 0.0 {
+                self.output.push_str(&format!(
+                    "<rect x=\"{:.4}\" y=\"{:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\"/>\n",
+                    x, y - font_size, text_width, font_size * 1.2,
+                    color_to_svg(style.shade_color),
+                ));
+            }
+        }
+
         // Task #257: `·`(U+00B7) 를 <text> 대신 <circle> 로 렌더한다.
         //
         // 폰트 대체(휴먼명조→Batang 등)로 각 폰트의 `·` 글리프 LSB 와 글리프
@@ -1870,14 +1946,68 @@ impl Renderer for SvgRenderer {
         let dot_radius = font_size * 0.08;
         let dot_cy_offset = -font_size * 0.35;
 
+        // Task #352: 3+ 연속 '-' 시퀀스(빈칸/leader) 를 단일 가로선으로 대체.
+        // Stage 2 가 advance 를 좁히면 글리프 폭이 advance 를 초과해 시각상
+        // 겹치므로 글리프 출력은 스킵하고 라인으로 통합. 가운데점 패턴과 동일.
+        // 단, 같은 run 에 underline 이 설정된 경우 underline 이 빈칸의 시각
+        // representation 을 담당하므로 dash leader 라인은 생략 (이중선 방지).
+        let suppress_dash_leader_line = !matches!(style.underline, UnderlineType::None);
+        let dash_run_groups: Vec<(usize, usize)> = {
+            let mut groups = Vec::new();
+            let mut run_start: Option<usize> = None;
+            for (idx, (_, cs)) in clusters.iter().enumerate() {
+                if cs == "-" {
+                    if run_start.is_none() { run_start = Some(idx); }
+                } else if let Some(s) = run_start.take() {
+                    if idx - s >= 3 { groups.push((s, idx)); }
+                }
+            }
+            if let Some(s) = run_start {
+                if clusters.len() - s >= 3 { groups.push((s, clusters.len())); }
+            }
+            groups
+        };
+        let dash_line_y_offset = -font_size * 0.32; // baseline 기준 dash 중앙선 근사
+        let dash_line_stroke_w = (font_size * 0.07).max(0.5);
+        let cluster_in_dash_run = |cluster_idx: usize| -> Option<(f64, f64)> {
+            // 첫 cluster 위치라면 (line_x1, line_x2) 반환, 외 None
+            for &(s, e) in &dash_run_groups {
+                if cluster_idx == s {
+                    let start_char_idx = clusters[s].0;
+                    let last = &clusters[e - 1];
+                    let end_char_idx = last.0 + last.1.chars().count();
+                    let x1 = char_positions.get(start_char_idx).copied().unwrap_or(0.0);
+                    let x2 = char_positions.get(end_char_idx).copied()
+                        .unwrap_or_else(|| *char_positions.last().unwrap_or(&0.0));
+                    return Some((x1, x2));
+                }
+                if cluster_idx > s && cluster_idx < e {
+                    // run 내부 dash: 라인은 한 번만 그리고 글리프 출력은 모두 스킵
+                    return Some((f64::NAN, f64::NAN));
+                }
+            }
+            None
+        };
+
         // 그림자 렌더링 (원본 아래에 오프셋된 그림자색 텍스트)
         if style.shadow_type > 0 {
             let shadow_color = color_to_svg(style.shadow_color);
             let shadow_attrs = format!("{} fill=\"{}\"", base_attrs, shadow_color);
             let dx = style.shadow_offset_x;
             let dy = style.shadow_offset_y;
-            for (char_idx, cluster_str) in &clusters {
+            for (cluster_idx, (char_idx, cluster_str)) in clusters.iter().enumerate() {
                 if cluster_str == " " || cluster_str == "\t" { continue; }
+                // Task #352: dash leader 시퀀스는 글리프 스킵, 필요 시 라인 1 회
+                if let Some((x1_rel, x2_rel)) = cluster_in_dash_run(cluster_idx) {
+                    if x1_rel.is_finite() && !suppress_dash_leader_line {
+                        let line_y = y + dash_line_y_offset + dy;
+                        self.output.push_str(&format!(
+                            "<line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\" stroke=\"{}\" stroke-width=\"{:.4}\"/>\n",
+                            x + x1_rel + dx, line_y, x + x2_rel + dx, line_y, shadow_color, dash_line_stroke_w,
+                        ));
+                    }
+                    continue;
+                }
                 if is_middle_dot(cluster_str) {
                     let adv = cluster_advance(*char_idx, cluster_str);
                     let cx = x + char_positions[*char_idx] + adv / 2.0 + dx;
@@ -1906,8 +2036,19 @@ impl Renderer for SvgRenderer {
 
         // 원본 텍스트 렌더링
         let common_attrs = format!("{} fill=\"{}\"", base_attrs, color);
-        for (char_idx, cluster_str) in &clusters {
+        for (cluster_idx, (char_idx, cluster_str)) in clusters.iter().enumerate() {
             if cluster_str == " " || cluster_str == "\t" { continue; }
+            // Task #352: dash leader 시퀀스는 글리프 스킵, 필요 시 라인 1 회
+            if let Some((x1_rel, x2_rel)) = cluster_in_dash_run(cluster_idx) {
+                if x1_rel.is_finite() && !suppress_dash_leader_line {
+                    let line_y = y + dash_line_y_offset;
+                    self.output.push_str(&format!(
+                        "<line x1=\"{:.4}\" y1=\"{:.4}\" x2=\"{:.4}\" y2=\"{:.4}\" stroke=\"{}\" stroke-width=\"{:.4}\"/>\n",
+                        x + x1_rel, line_y, x + x2_rel, line_y, color, dash_line_stroke_w,
+                    ));
+                }
+                continue;
+            }
             if is_middle_dot(cluster_str) {
                 let adv = cluster_advance(*char_idx, cluster_str);
                 let cx = x + char_positions[*char_idx] + adv / 2.0;
@@ -2168,6 +2309,11 @@ impl Renderer for SvgRenderer {
                 Some(svg_bytes) => (std::borrow::Cow::Owned(svg_bytes), "image/svg+xml"),
                 None => (std::borrow::Cow::Borrowed(data), mime_type),
             }
+        } else if mime_type == "image/x-pcx" {
+            match pcx_bytes_to_png_bytes(data) {
+                Some(png_bytes) => (std::borrow::Cow::Owned(png_bytes), "image/png"),
+                None => (std::borrow::Cow::Borrowed(data), mime_type),
+            }
         } else {
             (std::borrow::Cow::Borrowed(data), mime_type)
         };
@@ -2233,6 +2379,70 @@ pub(crate) fn bmp_bytes_to_png_bytes(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// PCX 바이트를 PNG 바이트로 재인코딩한다. 실패 시 None 반환.
+///
+/// 브라우저는 PCX 포맷을 native 렌더링하지 못하므로 (구형 ZSoft Paintbrush 포맷),
+/// SVG 임베딩 전에 PNG로 변환해 호환성을 확보한다.
+/// paletted PCX (8bpp) 와 RGB PCX (24bpp) 모두 지원.
+///
+/// **투명 처리**: PCX 자체는 알파 채널을 지원하지 않지만, HWP 의 PCX 임베드는
+/// 보통 BehindText (글뒤로) 배경/로고 용도로 흰색 (255,255,255) 영역을 투명으로
+/// 보여야 한다 (한컴 호환). 변환 시 흰색 픽셀을 투명 알파로 매핑한 RGBA PNG 를
+/// 출력한다.
+pub(crate) fn pcx_bytes_to_png_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    use image::{ImageFormat, RgbaImage};
+    use std::io::Cursor;
+    let mut reader = pcx::Reader::new(Cursor::new(data)).ok()?;
+    let width = reader.width() as u32;
+    let height = reader.height() as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixel_count = (width as usize) * (height as usize);
+    let mut rgba = vec![0u8; pixel_count * 4];
+    if reader.is_paletted() {
+        // paletted: row 별 인덱스 읽기 + 끝에서 팔레트 추출
+        let row_bytes = width as usize;
+        let mut indices = vec![0u8; row_bytes * height as usize];
+        for y in 0..height as usize {
+            reader
+                .next_row_paletted(&mut indices[y * row_bytes..(y + 1) * row_bytes])
+                .ok()?;
+        }
+        let mut palette = vec![0u8; 256 * 3];
+        reader.read_palette(&mut palette).ok()?;
+        for (dst, &idx) in rgba.chunks_exact_mut(4).zip(indices.iter()) {
+            let p = idx as usize * 3;
+            let r = palette[p];
+            let g = palette[p + 1];
+            let b = palette[p + 2];
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+            // 흰색 (255,255,255) → 투명 (한컴 BehindText 배경 호환)
+            dst[3] = if r == 255 && g == 255 && b == 255 { 0 } else { 255 };
+        }
+    } else {
+        // RGB: row 별 RGB 읽고 RGBA 로 확장
+        let row_bytes_rgb = width as usize * 3;
+        let mut rgb_row = vec![0u8; row_bytes_rgb];
+        for y in 0..height as usize {
+            reader.next_row_rgb(&mut rgb_row).ok()?;
+            for (x, src) in rgb_row.chunks_exact(3).enumerate() {
+                let dst = &mut rgba[(y * width as usize + x) * 4..(y * width as usize + x) * 4 + 4];
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = if src[0] == 255 && src[1] == 255 && src[2] == 255 { 0 } else { 255 };
+            }
+        }
+    }
+    let img = RgbaImage::from_raw(width, height, rgba)?;
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png).ok()?;
+    Some(out)
+}
+
 /// 이미지 데이터에서 MIME 타입 감지
 pub(crate) fn detect_image_mime_type(data: &[u8]) -> &'static str {
     if data.len() >= 8 {
@@ -2261,11 +2471,44 @@ pub(crate) fn detect_image_mime_type(data: &[u8]) -> &'static str {
             return "image/tiff";
         }
     }
+    // PCX: 0A 05 (ZSoft Paintbrush v3.0+, 1980년대 비표준 포맷)
+    // 브라우저 native 미지원 → emit 시 PNG 변환 필요 (pcx_bytes_to_png_bytes)
+    if data.len() >= 2 && data.starts_with(&[0x0A, 0x05]) {
+        return "image/x-pcx";
+    }
     // 알 수 없는 형식 → 기본값
     "application/octet-stream"
 }
 
 /// 이미지 데이터에서 픽셀 크기(width, height)를 파싱한다.
+/// HWP `pic.crop` (HWPUNIT) 로부터 SVG `viewBox` 에 쓸 원본 픽셀 단위
+/// source rect (x, y, w, h) 를 계산한다.
+///
+/// [Task #477] HWP 표준 룰: 1 inch = 7200 HU = 96 px → **75 HU/px** (DPI 96).
+/// 한컴이 BinData 에 저장하는 image 의 표준 DPI 이며, crop 좌표 (HU) 와 image
+/// 픽셀의 변환은 이 표준 scale 로 항상 정합한다.
+///
+/// `original_size_hu` 인자는 라운드트립 보존 메타로만 유지하며 계산에는 사용하지
+/// 않는다 (Task #430 이 도입했던 `orig/img_w` scale 은 일부 케이스에서 결함을
+/// 유발 — k-water-rfp pi=31 등에서 image 좌측만 표시되는 회귀).
+pub(crate) fn compute_image_crop_src(
+    crop_hu: (i32, i32, i32, i32),
+    _original_size_hu: Option<(u32, u32)>,
+    _img_w_px: f64,
+    _img_h_px: f64,
+) -> (f64, f64, f64, f64) {
+    let (cl, ct, cr, cb) = crop_hu;
+    // HWP 표준 DPI 96 = 75 HU/px
+    const HU_PER_PX: f64 = 75.0;
+    let scale_x = HU_PER_PX;
+    let scale_y = HU_PER_PX;
+    let src_x = cl as f64 / scale_x;
+    let src_y = ct as f64 / scale_y;
+    let src_w = (cr - cl) as f64 / scale_x;
+    let src_h = (cb - ct) as f64 / scale_y;
+    (src_x, src_y, src_w, src_h)
+}
+
 fn parse_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() < 24 {
         return None;

@@ -7,20 +7,64 @@ use crate::model::paragraph::Paragraph;
 use crate::model::page::ColumnDef;
 use crate::renderer::pagination::{Paginator, PaginationResult};
 use crate::renderer::height_measurer::{MeasuredTable, MeasuredSection, HeightMeasurer};
+use crate::renderer::layer_renderer::LayerRenderer;
 use crate::renderer::layout::LayoutEngine;
 use crate::renderer::render_tree::PageRenderTree;
 use crate::renderer::svg::SvgRenderer;
+use crate::renderer::svg_layer::SvgLayerRenderer;
 use crate::renderer::html::HtmlRenderer;
 use crate::renderer::canvas::CanvasRenderer;
 use crate::renderer::style_resolver::resolve_styles;
 use crate::renderer::composer::{compose_section, compose_paragraph, ComposedParagraph};
 use crate::renderer::page_layout::PageLayoutInfo;
+use crate::paint::{LayerBuilder, LayerOutputOptions, PageLayerTree, RenderProfile};
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use super::super::helpers::color_ref_to_css;
 
 impl DocumentCore {
+    /// 페이지 렌더 트리를 생성하여 반환한다 (native bridge / 외부 렌더러용).
+    pub fn build_page_render_tree(&self, page_num: u32) -> Result<PageRenderTree, HwpError> {
+        let tree = self.build_page_tree(page_num)?;
+        let _overflows = self.layout_engine.take_overflows();
+        Ok(tree)
+    }
+
+    /// 페이지 레이어 트리를 생성하여 반환한다 (native bridge / backend replay용).
+    pub fn build_page_layer_tree(&self, page_num: u32) -> Result<PageLayerTree, HwpError> {
+        let tree = self.build_page_tree(page_num)?;
+        let _overflows = self.layout_engine.take_overflows();
+        let output_options = LayerOutputOptions {
+            show_paragraph_marks: self.show_paragraph_marks,
+            show_control_codes: self.show_control_codes,
+            show_transparent_borders: self.show_transparent_borders,
+            clip_enabled: self.clip_enabled,
+            debug_overlay: self.debug_overlay,
+        };
+        let mut builder =
+            LayerBuilder::new(RenderProfile::Screen).with_output_options(output_options);
+        Ok(builder.build(&tree))
+    }
+
+    /// 바이너리 데이터를 0-based `bin_data_content` 인덱스로 반환한다.
+    pub fn get_bin_data(&self, index: usize) -> Option<&[u8]> {
+        self.document
+            .bin_data_content
+            .get(index)
+            .map(|b| b.data.as_slice())
+    }
+
     pub fn render_page_svg_native(&self, page_num: u32) -> Result<String, HwpError> {
+        if matches!(
+            std::env::var("RHWP_RENDER_PATH").ok().as_deref(),
+            Some("layer-svg")
+        ) {
+            return self.render_page_svg_layer_native(page_num);
+        }
+        self.render_page_svg_legacy_native(page_num)
+    }
+
+    pub fn render_page_svg_legacy_native(&self, page_num: u32) -> Result<String, HwpError> {
         let tree = self.build_page_tree(page_num)?;
         let _overflows = self.layout_engine.take_overflows();
         let mut renderer = SvgRenderer::new();
@@ -28,6 +72,16 @@ impl DocumentCore {
         renderer.show_control_codes = self.show_control_codes;
         renderer.debug_overlay = self.debug_overlay;
         renderer.render_tree(&tree);
+        Ok(renderer.output().to_string())
+    }
+
+    pub fn render_page_svg_layer_native(&self, page_num: u32) -> Result<String, HwpError> {
+        let layer_tree = self.build_page_layer_tree(page_num)?;
+        let mut renderer = SvgLayerRenderer::new();
+        renderer.inner_mut().show_paragraph_marks = self.show_paragraph_marks;
+        renderer.inner_mut().show_control_codes = self.show_control_codes;
+        renderer.inner_mut().debug_overlay = self.debug_overlay;
+        renderer.render_page(&layer_tree)?;
         Ok(renderer.output().to_string())
     }
 
@@ -79,11 +133,22 @@ impl DocumentCore {
 
     /// Canvas 렌더링 (네이티브 에러 타입)
     pub fn render_page_canvas_native(&self, page_num: u32) -> Result<u32, HwpError> {
+        let tree = self.build_page_layer_tree(page_num)?;
+        let mut renderer = CanvasRenderer::new();
+        renderer.render_page(&tree)?;
+        Ok(renderer.command_count() as u32)
+    }
+
+    pub fn render_page_canvas_legacy_native(&self, page_num: u32) -> Result<u32, HwpError> {
         let tree = self.build_page_tree(page_num)?;
         let _overflows = self.layout_engine.take_overflows();
         let mut renderer = CanvasRenderer::new();
         renderer.render_tree(&tree);
         Ok(renderer.command_count() as u32)
+    }
+
+    pub fn get_page_layer_tree_native(&self, page_num: u32) -> Result<String, HwpError> {
+        Ok(self.build_page_layer_tree(page_num)?.to_json())
     }
 
     /// 페이지 정보 (네이티브 에러 타입)
@@ -473,11 +538,22 @@ impl DocumentCore {
                         }
                         _ => String::new(),
                     };
+                    // Task #516 결함 3: hit-test 정합 (옵션 3-C) — wrap 모드 노출.
+                    // BehindText 그림은 텍스트 영역 위에서는 hit-test 후순위 처리.
+                    let wrap_str = match image_node.text_wrap {
+                        Some(crate::model::shape::TextWrap::BehindText) => ",\"wrap\":\"behindText\"",
+                        Some(crate::model::shape::TextWrap::InFrontOfText) => ",\"wrap\":\"inFrontOfText\"",
+                        Some(crate::model::shape::TextWrap::Square) => ",\"wrap\":\"square\"",
+                        Some(crate::model::shape::TextWrap::Tight) => ",\"wrap\":\"tight\"",
+                        Some(crate::model::shape::TextWrap::Through) => ",\"wrap\":\"through\"",
+                        Some(crate::model::shape::TextWrap::TopAndBottom) => ",\"wrap\":\"topAndBottom\"",
+                        None => "",
+                    };
 
                     controls.push(format!(
-                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}}}",
+                        "{{\"type\":\"image\",\"x\":{:.1},\"y\":{:.1},\"w\":{:.1},\"h\":{:.1}{}{}}}",
                         node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
-                        doc_coords
+                        doc_coords, wrap_str
                     ));
                     return;
                 }
@@ -954,9 +1030,26 @@ impl DocumentCore {
                                 master_page_index: replace_idx,
                             });
                         }
-                        // 겹침형 확장은 extra로 추가
-                        if !overlap_exts.is_empty() {
-                            page.extra_master_pages = overlap_exts.iter()
+                        // 겹침형 확장:
+                        // - apply_to 가 active 와 동일: 같은 위치(헤더/푸터/배경) 컨텐츠가 충돌 → active 대체
+                        //   (HWP 작성자가 마지막 쪽 전용 헤더로 의도. 한컴 PDF 출력 동작과 일치)
+                        // - apply_to 가 다름(예: active=Odd, 확장=Both): 보조 컨텐츠 추가 → extra
+                        let active_apply = page.active_master_page.as_ref()
+                            .and_then(|mp_ref| mps.get(mp_ref.master_page_index))
+                            .map(|m| m.apply_to);
+                        let mut remaining_overlap_exts: Vec<usize> = Vec::new();
+                        for &i in &overlap_exts {
+                            if Some(mps[i].apply_to) == active_apply {
+                                page.active_master_page = Some(MasterPageRef {
+                                    section_index: idx,
+                                    master_page_index: i,
+                                });
+                            } else {
+                                remaining_overlap_exts.push(i);
+                            }
+                        }
+                        if !remaining_overlap_exts.is_empty() {
+                            page.extra_master_pages = remaining_overlap_exts.iter()
                                 .map(|&mi| MasterPageRef { section_index: idx, master_page_index: mi })
                                 .collect();
                         }
@@ -1351,7 +1444,8 @@ impl DocumentCore {
                                 out.push_str(&format!("    Table          pi={} ci={}  {}  {}\n",
                                     para_index, control_index, table_info, vpos_info));
                             }
-                            PageItem::PartialTable { para_index, control_index, start_row, end_row, is_continuation, .. } => {
+                            PageItem::PartialTable { para_index, control_index, start_row, end_row, is_continuation,
+                                                     split_start_content_offset, split_end_content_limit } => {
                                 let table_info = paragraphs.get(*para_index)
                                     .and_then(|p| p.controls.get(*control_index))
                                     .map(|c| {
@@ -1361,8 +1455,14 @@ impl DocumentCore {
                                     })
                                     .unwrap_or_default();
                                 let vpos_info = format_vpos_range(paragraphs.get(*para_index), None, None);
-                                out.push_str(&format!("    PartialTable   pi={} ci={}  rows={}..{}  cont={}  {}  {}\n",
-                                    para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info));
+                                // [Task #431] 분할 표 진단 정보 — split_start/end 가 0 이 아니면 셀 내 분할
+                                let split_info = if *split_start_content_offset > 0.0 || *split_end_content_limit > 0.0 {
+                                    format!("  split_start={:.1} split_end={:.1}", split_start_content_offset, split_end_content_limit)
+                                } else {
+                                    String::new()
+                                };
+                                out.push_str(&format!("    PartialTable   pi={} ci={}  rows={}..{}  cont={}  {}  {}{}\n",
+                                    para_index, control_index, start_row, end_row, is_continuation, table_info, vpos_info, split_info));
                             }
                             PageItem::Shape { para_index, control_index } => {
                                 let shape_info = paragraphs.get(*para_index)
@@ -2010,4 +2110,47 @@ fn format_vpos_range(
         s_out.push_str(&format!(" [vpos-reset@line{}]", r));
     }
     s_out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::bin_data::BinDataContent;
+    use crate::renderer::render_tree::RenderNodeType;
+
+    #[test]
+    fn build_page_render_tree_exposes_public_page_tree() {
+        let mut core = DocumentCore::new_empty();
+        core.paginate();
+
+        let tree = core
+            .build_page_render_tree(0)
+            .expect("empty document should expose page render tree");
+
+        match tree.root.node_type {
+            RenderNodeType::Page(page) => {
+                assert_eq!(page.page_index, 0);
+            }
+            other => panic!("root should be Page node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn get_bin_data_returns_zero_based_content_slice() {
+        let mut core = DocumentCore::new_empty();
+        core.document.bin_data_content.push(BinDataContent {
+            id: 1,
+            data: vec![0x01, 0x02, 0x03],
+            extension: "png".to_string(),
+        });
+        core.document.bin_data_content.push(BinDataContent {
+            id: 2,
+            data: vec![0xAA, 0xBB],
+            extension: "jpg".to_string(),
+        });
+
+        assert_eq!(core.get_bin_data(0), Some(&[0x01, 0x02, 0x03][..]));
+        assert_eq!(core.get_bin_data(1), Some(&[0xAA, 0xBB][..]));
+        assert_eq!(core.get_bin_data(2), None);
+    }
 }

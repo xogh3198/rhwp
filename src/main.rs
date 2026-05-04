@@ -21,6 +21,7 @@ fn main() {
         Some("test-shape") => test_shape_roundtrip(&args[2..]),
         Some("test-caption") => test_caption(&args[2..]),
         Some("gen-table") => gen_table(&args[2..]),
+        Some("gen-pua") => gen_pua_test(&args[2..]),
         Some("test-field") => test_field_roundtrip(&args[2..]),
         Some("ir-diff") => ir_diff(&args[2..]),
         Some("thumbnail") => extract_thumbnail(&args[2..]),
@@ -1234,11 +1235,11 @@ fn dump_controls(args: &[String]) {
     let dump_common = |c: &rhwp::model::shape::CommonObjAttr, indent: &str| {
         println!("{}  크기: {:.1}mm × {:.1}mm ({}×{} HU)",
             indent, hu_to_mm(c.width), hu_to_mm(c.height), c.width, c.height);
-        println!("{}  위치: 가로={} 오프셋={:.1}mm({}), 세로={} 오프셋={:.1}mm({})",
+        println!("{}  위치: 가로={} 오프셋={:.1}mm({}) 정렬={:?}, 세로={} 오프셋={:.1}mm({}) 정렬={:?}",
             indent, horz_str(&c.horz_rel_to),
-            hu_to_mm(c.horizontal_offset), c.horizontal_offset,
+            hu_to_mm(c.horizontal_offset), c.horizontal_offset, c.horz_align,
             vert_str(&c.vert_rel_to),
-            hu_to_mm(c.vertical_offset), c.vertical_offset);
+            hu_to_mm(c.vertical_offset), c.vertical_offset, c.vert_align);
         println!("{}  배치: {}, 글자처럼={}, z={}",
             indent, wrap_str(&c.text_wrap), c.treat_as_char, c.z_order);
     };
@@ -1426,7 +1427,10 @@ fn dump_controls(args: &[String]) {
                                 }
                                 desc
                             }
-                            Control::Picture(p) => format!("그림(bin_id={}, w={}, h={}, tac={})", p.image_attr.bin_data_id, p.common.width, p.common.height, p.common.treat_as_char),
+                            Control::Picture(p) => {
+                                let wm = p.image_attr.watermark_preset().map(|s| format!(", watermark={}", s)).unwrap_or_default();
+                                format!("그림(bin_id={}, w={}, h={}, tac={}{})", p.image_attr.bin_data_id, p.common.width, p.common.height, p.common.treat_as_char, wm)
+                            },
                             Control::Header(_) => "머리말".to_string(),
                             Control::Footer(_) => "꼬리말".to_string(),
                             _ => format!("{:?}", std::mem::discriminant(ctrl)),
@@ -1640,14 +1644,20 @@ fn dump_controls(args: &[String]) {
                                     for (ci, ctrl) in cp.controls.iter().enumerate() {
                                         match ctrl {
                                             Control::Picture(p) => {
-                                                println!("{}    ctrl[{}] 그림: bin_id={}, w={} h={} ({:.1}×{:.1}mm), tac={}, wrap={:?}, vert={:?}(off={}), horz={:?}(off={})",
+                                                println!("{}    ctrl[{}] 그림: bin_id={}, w={} h={} ({:.1}×{:.1}mm), tac={}, wrap={:?}, vert={:?}(off={}), horz={:?}(off={}), orig={}×{}, cur={}×{}, crop=({},{},{},{})",
                                                     indent, ci, p.image_attr.bin_data_id,
                                                     p.common.width, p.common.height,
                                                     p.common.width as f64 / 7200.0 * 25.4,
                                                     p.common.height as f64 / 7200.0 * 25.4,
                                                     p.common.treat_as_char,
                                                     p.common.text_wrap, p.common.vert_rel_to, p.common.vertical_offset,
-                                                    p.common.horz_rel_to, p.common.horizontal_offset);
+                                                    p.common.horz_rel_to, p.common.horizontal_offset,
+                                                    p.shape_attr.original_width, p.shape_attr.original_height,
+                                                    p.shape_attr.current_width, p.shape_attr.current_height,
+                                                    p.crop.left, p.crop.top, p.crop.right, p.crop.bottom);
+                                                println!("{}      [image_attr] effect={:?} brightness={} contrast={} watermark={}",
+                                                    indent, p.image_attr.effect, p.image_attr.brightness, p.image_attr.contrast,
+                                                    p.image_attr.watermark_preset().unwrap_or("none"));
                                             }
                                             Control::Shape(s) => {
                                                 println!("{}    ctrl[{}] {}: tac={}, wrap={:?}",
@@ -1688,6 +1698,9 @@ fn dump_controls(args: &[String]) {
                             sa.current_width, sa.current_height,
                             sa.current_width as f64 / 7200.0 * 25.4, sa.current_height as f64 / 7200.0 * 25.4,
                             pic.common.treat_as_char);
+                        println!("{}  [image_attr] effect={:?} brightness={} contrast={} watermark={}",
+                            prefix, pic.image_attr.effect, pic.image_attr.brightness, pic.image_attr.contrast,
+                            pic.image_attr.watermark_preset().unwrap_or("none"));
                         println!("{}  border_x={:?} border_y={:?} border_color=#{:06X} border_width={} ({:.2}mm) border_attr={:?}",
                             prefix, pic.border_x, pic.border_y,
                             pic.border_color, pic.border_width, pic.border_width as f64 / 7200.0 * 25.4,
@@ -2256,6 +2269,98 @@ fn gen_table(args: &[String]) {
     }
     fs::write(out_path, bytes).expect("파일 저장 실패");
     println!("저장 완료: {} ({}행 × {}열)", output, rows, cols);
+}
+
+/// PUA (Private Use Area) 문자 셋트를 입력한 HWP 테스트 문서 생성.
+///
+/// Task #509 (PUA 회귀 정정) 의 한컴 정답지 확보용. 본 라이브러리가 발견한
+/// 14 샘플 광범위 PUA 코드포인트 18 종을 한 문서에 입력 → 한컴 편집기로 PDF
+/// 출력 + rhwp SVG 출력 시각 비교.
+///
+/// 사용:
+///   rhwp gen-pua [output_path]
+///   기본 출력: output/pua-test.hwp
+fn gen_pua_test(args: &[String]) {
+    let output = args.first().map(|s| s.as_str()).unwrap_or("output/pua-test.hwp");
+
+    println!("PUA 문자 셋트 입력 HWP 문서 생성 중...");
+
+    let mut core = rhwp::document_core::DocumentCore::new_empty();
+    core.create_blank_document_native().expect("빈 문서 생성 실패");
+
+    // PUA 코드포인트 셋트 (Task #509 Stage 1 의 14 샘플 광범위 통계 정합)
+    // (codepoint, 영역 분류, 사용 샘플, 본 라이브러리 현재 매핑)
+    let pua_set: &[(u32, &str, &str, &str)] = &[
+        // ── Basic PUA (0xF020~0xF0FF) — 매핑 표 적용 영역 ──
+        (0x0F076, "Basic",      "mel-001",      "❖ U+2756"),
+        (0x0F09F, "Basic",      "biz_plan",     "• U+2022"),
+        (0x0F0A0, "Basic",      "synam-001",    "▪ U+25AA"),
+        (0x0F0A7, "Basic",      "kps-ai",       "▪ U+25AA"),
+        (0x0F0E8, "Basic",      "kps-ai",       "(미정의)"),
+        (0x0F0F2, "Basic",      "KTX",          "⇩ U+21E9 (의도 정정 후보)"),
+        (0x0F0FE, "Basic",      "k-water-rfp",  "☑ U+2611"),
+        // ── Basic PUA — 매핑 표 외 영역 ──
+        (0x0F53A, "Basic-out",  "hwpspec",      "(매핑 표 외)"),
+        // ── Supplementary PUA-A (0xF0000~0xFFFFD) — 매핑 표 미지원 영역 ──
+        (0xF02B1, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B2, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B3, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B4, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B5, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B6, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B7, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B8, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02B9, "Suppl-A",    "mel-001",      "(매핑 표 외)"),
+        (0xF02EF, "Suppl-A",    "KTX (회귀)",   "(매핑 표 외) ★"),
+    ];
+
+    println!("  PUA 코드포인트 {} 종 입력", pua_set.len());
+
+    core.begin_batch_native().expect("배치 시작 실패");
+
+    // 첫 paragraph (0번) 에 제목 입력
+    let title = "[PUA 회귀 검증 — Task #509]";
+    core.insert_text_native(0, 0, 0, title).expect("제목 입력 실패");
+
+    // 각 PUA 글자별로 paragraph 추가:
+    // "U+0F0F2 (Basic, KTX): {char}    ← 한컴 정답지 / rhwp 비교"
+    // 빈 paragraph 추가 + 텍스트 입력 패턴
+    for (i, &(cp, area, sample, mapping)) in pua_set.iter().enumerate() {
+        let pi = i + 1; // 0번은 제목, 1번부터 PUA paragraphs
+
+        // 새 paragraph 추가 (pi 위치에 새 문단 삽입)
+        core.insert_paragraph_native(0, pi)
+            .unwrap_or_else(|e| panic!("paragraph 추가 실패 (pi={}): {:?}", pi, e));
+
+        // PUA 글자 char 변환 (i32 unsafe 회피)
+        let pua_char = char::from_u32(cp)
+            .unwrap_or_else(|| panic!("invalid codepoint U+{:05X}", cp));
+
+        // 텍스트: "U+0F0F2 (Basic, KTX, ⇩ U+21E9 매핑): " + PUA + "  ← 한컴 PDF 글리프 정답지"
+        let text = format!(
+            "U+{:05X} ({}, {}, {}): {}  ← 한컴 PDF 정답지",
+            cp, area, sample, mapping, pua_char
+        );
+
+        core.insert_text_native(0, pi, 0, &text)
+            .unwrap_or_else(|e| panic!("텍스트 입력 실패 (pi={}): {:?}", pi, e));
+    }
+
+    core.end_batch_native().expect("배치 종료 실패");
+
+    // 저장
+    let bytes = core.export_hwp_native().expect("HWP 내보내기 실패");
+    let out_path = Path::new(output);
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(out_path, bytes).expect("파일 저장 실패");
+    println!("저장 완료: {} ({} 종 PUA)", output, pua_set.len());
+    println!();
+    println!("다음 단계:");
+    println!("  1. 한컴 2022 편집기에서 본 파일 열기 → PDF 출력 (정답지)");
+    println!("  2. rhwp export-svg {} → SVG 출력 비교", output);
+    println!("  3. 시각 비교로 매핑 정합 확정");
 }
 
 fn test_field_roundtrip(args: &[String]) {

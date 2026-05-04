@@ -220,6 +220,19 @@ impl LayoutEngine {
         } else {
             None
         };
+        // [Issue #476] treat_as_char Shape는 paragraph_layout이 inline_pos 등록 후
+        // 본 함수가 그려야 한다. inline_pos 가 없는 경우는 paginator 가 PageItem::Shape 를
+        // 잘못된 페이지(박스가 속한 line이 라우팅되지 않은 페이지)에 등록한 결과이며,
+        // compute_object_position fallback 으로 그리면 절대 좌표(예: 문단 오프셋=0,0)
+        // 기준의 잘못된 위치에 박스가 출현한다 (= 다른 paragraph 영역에 침범).
+        // 본질 수정 전까지(paginator A 단계) fallback 그리기를 차단한다.
+        if common.treat_as_char && inline_pos.is_none() {
+            if std::env::var("RHWP_DEBUG_LAYOUT").is_ok() {
+                eprintln!("[#476 skip] inline Shape without inline_pos: sec={} para={} ci={}",
+                    section_index, para_index, control_index);
+            }
+            return;
+        }
 
         // 통합 좌표 계산 (layout_body_picture와 동일 로직)
         let shape_container = LayoutRect {
@@ -959,6 +972,9 @@ impl LayoutEngine {
                     RenderNodeType::Image(ImageNode {
                         transform,
                         effect: pic.image_attr.effect,
+                        brightness: pic.image_attr.brightness,
+                        contrast: pic.image_attr.contrast,
+                        text_wrap: Some(pic.common.text_wrap),
                         ..ImageNode::new(bin_data_id, image_data)
                     }),
                     BoundingBox::new(render_x, render_y, render_w, render_h),
@@ -1512,14 +1528,21 @@ impl LayoutEngine {
                             // 인라인 이미지: 수평으로 순차 배치
                             let pic_w = hwpunit_to_px(pic.common.width as i32, self.dpi);
                             let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                            // [Task #477] 도형 컨테이너 폭 초과 시 비율 유지 클램프
+                            let clamped_w = pic_w.min(inner_area.width);
+                            let clamped_h = if pic_w > 0.0 {
+                                pic_h * (clamped_w / pic_w)
+                            } else {
+                                pic_h
+                            };
                             let pic_container = LayoutRect {
                                 x: inline_x,
                                 y: inline_y,
-                                width: pic_w,
-                                height: pic_h,
+                                width: clamped_w,
+                                height: clamped_h,
                             };
                             self.layout_picture(tree, shape_node, pic, &pic_container, bin_data_content, Alignment::Left, None, None, None);
-                            inline_x += pic_w;
+                            inline_x += clamped_w;
                         } else {
                             // 절대 위치 이미지
                             let pic_container = LayoutRect {

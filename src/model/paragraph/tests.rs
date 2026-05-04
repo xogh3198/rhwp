@@ -1,4 +1,6 @@
 use super::*;
+use crate::model::control::Bookmark;
+use crate::model::table::Table;
 
 #[test]
 fn test_paragraph_default() {
@@ -685,4 +687,163 @@ fn test_apply_char_shape_after_sequential_insert() {
     assert_eq!(para.char_shapes[1].start_pos, 2);
     assert_eq!(para.char_shapes[2].char_shape_id, 10); // 다라마바사
     assert_eq!(para.char_shapes[2].start_pos, 5);
+}
+
+#[test]
+fn test_control_text_positions_empty() {
+    let para = Paragraph::default();
+    assert_eq!(para.control_text_positions(), Vec::<usize>::new());
+}
+
+#[test]
+fn test_control_text_positions_no_offsets_inline_sequential() {
+    let para = Paragraph {
+        text: String::new(),
+        char_offsets: vec![],
+        controls: vec![
+            Control::Table(Box::<Table>::default()),
+            Control::Table(Box::<Table>::default()),
+        ],
+        ..Default::default()
+    };
+    // 인라인 컨트롤 2개: 첫 번째 push 0 후 pos += 1, 두 번째 push 1
+    assert_eq!(para.control_text_positions(), vec![0, 1]);
+}
+
+#[test]
+fn test_control_text_positions_gap_between_chars() {
+    // text = "AB", char_offsets = [0, 9] → 'A'(width 1) 와 'B' 사이 8 unit 갭 = inline ctrl 1개
+    let para = Paragraph {
+        text: "AB".to_string(),
+        char_offsets: vec![0, 9],
+        controls: vec![Control::Table(Box::<Table>::default())],
+        ..Default::default()
+    };
+    // controls[0] = 'A' 다음 character index 1
+    assert_eq!(para.control_text_positions(), vec![1]);
+}
+
+#[test]
+fn test_control_text_positions_gap_before() {
+    // text = "A", char_offsets = [8] → 'A' 앞에 8 unit 갭 = inline ctrl 1개
+    let para = Paragraph {
+        text: "A".to_string(),
+        char_offsets: vec![8],
+        controls: vec![Control::Table(Box::<Table>::default())],
+        ..Default::default()
+    };
+    // controls[0] = 'A' 이전 character index 0
+    assert_eq!(para.control_text_positions(), vec![0]);
+}
+
+#[test]
+fn test_control_text_positions_surrogate_pair_char_width() {
+    // text = "🎉A": '🎉'(U+1F389, surrogate pair, UTF-16 width=2) + 'A'(width=1)
+    // char_offsets = [0, 17] → 사이 gap = 17 - 0 - 2(surrogate width) = 15 = inline ctrl 1개
+    // controls 2 개로 width 분기 boundary 검증:
+    //   - width=2 정상: gap=15, n_ctrls=1, push position 1, fill last position chars.len()=2 → [1, 2]
+    //   - width=1 버그: gap=16, n_ctrls=2, push position 1 두 번 → [1, 1] (다른 결과)
+    let para = Paragraph {
+        text: "🎉A".to_string(),
+        char_offsets: vec![0, 17],
+        controls: vec![
+            Control::Table(Box::<Table>::default()),
+            Control::Table(Box::<Table>::default()),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(para.control_text_positions(), vec![1, 2]);
+}
+
+#[test]
+fn test_control_text_positions_no_offsets_non_inline_skipped() {
+    // `char_offsets` 비어있는 폴백 경로에서 비인라인 컨트롤 (Bookmark) 은 pos 증가시키지 않음.
+    // [Bookmark, Table, Bookmark] →
+    //   - Bookmark: push pos=0, 비인라인이라 pos 유지 (0)
+    //   - Table:    push pos=0, 인라인이라 pos += 1 (= 1)
+    //   - Bookmark: push pos=1, 비인라인이라 pos 유지
+    // 결과: [0, 0, 1]
+    let para = Paragraph {
+        text: String::new(),
+        char_offsets: vec![],
+        controls: vec![
+            Control::Bookmark(Bookmark::default()),
+            Control::Table(Box::<Table>::default()),
+            Control::Bookmark(Bookmark::default()),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(para.control_text_positions(), vec![0, 0, 1]);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_empty_offsets() {
+    // char_offsets 가 비어있으면 unwrap_or(char_offsets.len()) = 0 반환.
+    let para = Paragraph::default();
+    assert_eq!(para.utf16_pos_to_char_idx(0), 0);
+    assert_eq!(para.utf16_pos_to_char_idx(100), 0);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_zero_returns_first() {
+    // utf16_pos = 0 → 첫 entry (offsets[0] = 0 >= 0) 의 인덱스 0.
+    let para = Paragraph {
+        text: "ABC".to_string(),
+        char_offsets: vec![0, 1, 2],
+        ..Default::default()
+    };
+    assert_eq!(para.utf16_pos_to_char_idx(0), 0);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_exact_match() {
+    // offsets 안의 정확한 값일 때 해당 인덱스 반환.
+    let para = Paragraph {
+        text: "ABC".to_string(),
+        char_offsets: vec![0, 1, 2],
+        ..Default::default()
+    };
+    assert_eq!(para.utf16_pos_to_char_idx(1), 1);
+    assert_eq!(para.utf16_pos_to_char_idx(2), 2);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_between_offsets() {
+    // offsets 사이 값일 때 첫 entry >= utf16_pos 인 인덱스 반환.
+    // offsets = [0, 1, 3] (2번째 codepoint 는 SMP) → utf16_pos=2 는 첫
+    // entry >=2 인 3 의 인덱스 2.
+    let para = Paragraph {
+        text: "A🎉".to_string(),
+        char_offsets: vec![0, 1, 3],
+        ..Default::default()
+    };
+    assert_eq!(para.utf16_pos_to_char_idx(2), 2);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_beyond_end_returns_len() {
+    // utf16_pos 가 모든 entry 보다 크면 char_offsets.len() (텍스트 끝).
+    let para = Paragraph {
+        text: "ABC".to_string(),
+        char_offsets: vec![0, 1, 2],
+        ..Default::default()
+    };
+    assert_eq!(para.utf16_pos_to_char_idx(3), 3);
+    assert_eq!(para.utf16_pos_to_char_idx(100), 3);
+}
+
+#[test]
+fn test_utf16_pos_to_char_idx_surrogate_pair_midpoint() {
+    // text = "🎉A" → offsets = [0, 2] (🎉 가 UTF-16 width=2). utf16_pos=1
+    // (surrogate pair 의 low half) 도 첫 entry >=1 인 2 의 인덱스 1 반환 —
+    // 다음 codepoint 시작 위치로 정규화.
+    let para = Paragraph {
+        text: "🎉A".to_string(),
+        char_offsets: vec![0, 2],
+        ..Default::default()
+    };
+    assert_eq!(para.utf16_pos_to_char_idx(0), 0);
+    assert_eq!(para.utf16_pos_to_char_idx(1), 1);
+    assert_eq!(para.utf16_pos_to_char_idx(2), 1);
+    assert_eq!(para.utf16_pos_to_char_idx(3), 2); // beyond end
 }

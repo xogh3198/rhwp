@@ -7,44 +7,36 @@
 //! - `HwpDocument::render_page_svg(page_num)` - SVG로 렌더링
 //! - `HwpDocument::render_page_html(page_num)` - HTML로 렌더링
 
-
 // 하위 호환성: tests.rs에서 super::json_escape 등으로 접근 가능하도록 재내보내기
 pub(crate) use crate::document_core::helpers::*;
 
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use web_sys::HtmlCanvasElement;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashSet;
 
-use crate::model::document::{Document, Section};
-use crate::model::control::Control;
-use crate::model::paragraph::Paragraph;
-use crate::model::page::ColumnDef;
-use crate::model::path::{PathSegment, DocumentPath, path_from_flat};
-use crate::renderer::pagination::{Paginator, PaginationResult};
-use crate::renderer::height_measurer::{MeasuredTable, MeasuredSection, HeightMeasurer};
-use crate::renderer::layout::LayoutEngine;
-use crate::renderer::render_tree::PageRenderTree;
-use crate::renderer::svg::SvgRenderer;
-use crate::renderer::html::HtmlRenderer;
-use crate::renderer::canvas::CanvasRenderer;
-use crate::renderer::scheduler::{RenderScheduler, RenderObserver, RenderEvent, Viewport};
-use crate::renderer::style_resolver::{resolve_styles, resolve_font_substitution, ResolvedStyleSet};
-use crate::renderer::composer::{compose_section, compose_paragraph, reflow_line_segs, ComposedParagraph};
-use crate::renderer::page_layout::PageLayoutInfo;
-use crate::renderer::DEFAULT_DPI;
-use crate::error::HwpError;
 use crate::document_core::{DocumentCore, DEFAULT_FALLBACK_FONT};
-
-static PARAGRAPH_STABLE_ID_SEQ: AtomicU64 = AtomicU64::new(1);
-
-fn generate_paragraph_stable_id() -> String {
-    // wasm 환경(브라우저)에서는 std::time이 지원되지 않아 패닉이 날 수 있으므로
-    // 단조 증가 시퀀스 기반 ID를 사용한다.
-    let seq = PARAGRAPH_STABLE_ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("sid_{seq:016x}")
-}
+use crate::error::HwpError;
+use crate::model::control::Control;
+use crate::model::document::{Document, Section};
+use crate::model::page::ColumnDef;
+use crate::model::paragraph::Paragraph;
+use crate::model::path::{path_from_flat, DocumentPath, PathSegment};
+use crate::renderer::canvas::CanvasRenderer;
+use crate::renderer::composer::{
+    compose_paragraph, compose_section, reflow_line_segs, ComposedParagraph,
+};
+use crate::renderer::height_measurer::{HeightMeasurer, MeasuredSection, MeasuredTable};
+use crate::renderer::html::HtmlRenderer;
+use crate::renderer::layout::LayoutEngine;
+use crate::renderer::page_layout::PageLayoutInfo;
+use crate::renderer::pagination::{PaginationResult, Paginator};
+use crate::renderer::render_tree::PageRenderTree;
+use crate::renderer::scheduler::{RenderEvent, RenderObserver, RenderScheduler, Viewport};
+use crate::renderer::style_resolver::{
+    resolve_font_substitution, resolve_styles, ResolvedStyleSet,
+};
+use crate::renderer::svg::SvgRenderer;
+use crate::renderer::DEFAULT_DPI;
 
 impl From<HwpError> for JsValue {
     fn from(err: HwpError) -> Self {
@@ -176,20 +168,6 @@ impl HwpDocument {
         }
     }
 
-    /// 레거시 paginator 사용 여부를 설정한다.
-    /// TypesetEngine 호환 이슈 문서에서 레이아웃 안정화를 위해 fallback 경로를 강제한다.
-    #[wasm_bindgen(js_name = setUseLegacyPaginator)]
-    pub fn set_use_legacy_paginator(&mut self, enabled: bool) {
-        if self.use_legacy_paginator != enabled {
-            self.use_legacy_paginator = enabled;
-            for d in self.core.dirty_sections.iter_mut() {
-                *d = true;
-            }
-            self.invalidate_page_tree_cache();
-            self.core.paginate();
-        }
-    }
-
     /// 총 페이지 수를 반환한다.
     #[wasm_bindgen(js_name = pageCount)]
     pub fn page_count(&self) -> u32 {
@@ -211,7 +189,14 @@ impl HwpDocument {
     /// 특정 페이지를 Canvas 명령 수로 반환한다.
     #[wasm_bindgen(js_name = renderPageCanvas)]
     pub fn render_page_canvas(&self, page_num: u32) -> Result<u32, JsValue> {
-        self.render_page_canvas_native(page_num).map_err(|e| e.into())
+        self.render_page_canvas_native(page_num)
+            .map_err(|e| e.into())
+    }
+
+    #[wasm_bindgen(js_name = renderPageCanvasLegacy)]
+    pub fn render_page_canvas_legacy(&self, page_num: u32) -> Result<u32, JsValue> {
+        self.render_page_canvas_legacy_native(page_num)
+            .map_err(|e| e.into())
     }
 
     /// 특정 페이지를 Canvas 2D에 직접 렌더링한다.
@@ -226,21 +211,134 @@ impl HwpDocument {
         canvas: &HtmlCanvasElement,
         scale: f64,
     ) -> Result<(), JsValue> {
+        use crate::renderer::layer_renderer::LayerRenderer;
         use crate::renderer::web_canvas::WebCanvasRenderer;
 
-        let tree = self.build_page_tree_cached(page_num).map_err(|e| JsValue::from(e))?;
+        let tree = self.build_page_layer_tree(page_num).map_err(JsValue::from)?;
 
         // scale 정규화: 0 이하 또는 NaN이면 1.0, 최소 0.25 최대 12.0
         // (zoom 3.0 × DPR 4.0 = 12.0 지원)
-        let scale = if scale <= 0.0 || scale.is_nan() { 1.0 } else { scale.clamp(0.25, 12.0) };
+        let scale = if scale <= 0.0 || scale.is_nan() {
+            1.0
+        } else {
+            scale.clamp(0.25, 12.0)
+        };
 
         // 최대 캔버스 크기 가드 (16384px)
         let max_dim = 16384.0;
-        let scale = if tree.root.bbox.width * scale > max_dim || tree.root.bbox.height * scale > max_dim {
-            (max_dim / tree.root.bbox.width).min(max_dim / tree.root.bbox.height).min(scale)
+        let scale = if tree.page_width * scale > max_dim || tree.page_height * scale > max_dim {
+            (max_dim / tree.page_width)
+                .min(max_dim / tree.page_height)
+                .min(scale)
         } else {
             scale
         };
+
+        // 캔버스 크기 = 페이지 크기 × scale
+        canvas.set_width((tree.page_width * scale) as u32);
+        canvas.set_height((tree.page_height * scale) as u32);
+
+        let mut renderer = WebCanvasRenderer::new(canvas)?;
+        renderer.show_paragraph_marks = self.show_paragraph_marks;
+        renderer.show_control_codes = self.show_control_codes;
+        renderer.set_scale(scale);
+        renderer.render_page(&tree).map_err(JsValue::from)?;
+        Ok(())
+    }
+
+    /// 다층 레이어 필터를 적용한 Canvas 렌더링 (Task #516, Stage 5.2).
+    ///
+    /// `layer_kind`:
+    /// - `"all"` → 모든 그림 렌더 (기본 `renderPageToCanvas` 와 동일)
+    /// - `"flow"` → 본문 layer (BehindText / InFrontOfText 그림 제외)
+    /// - `"behind"` → BehindText overlay layer
+    /// - `"front"` → InFrontOfText overlay layer
+    ///
+    /// 본문 Canvas 와 overlay 컨테이너를 분리하는 다층 layer 아키텍처에서 사용.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = renderPageToCanvasFiltered)]
+    pub fn render_page_to_canvas_filtered(
+        &self,
+        page_num: u32,
+        canvas: &HtmlCanvasElement,
+        scale: f64,
+        layer_kind: &str,
+    ) -> Result<(), JsValue> {
+        use crate::renderer::layer_renderer::LayerRenderer;
+        use crate::renderer::web_canvas::{LayerFilter, WebCanvasRenderer};
+        use crate::model::shape::TextWrap;
+
+        let filter = match layer_kind {
+            "all" => LayerFilter::All,
+            "flow" => LayerFilter::FlowOnly,
+            "behind" => LayerFilter::WrapOnly(TextWrap::BehindText),
+            "front" => LayerFilter::WrapOnly(TextWrap::InFrontOfText),
+            _ => return Err(JsValue::from_str(
+                "invalid layer_kind: 'all' | 'flow' | 'behind' | 'front'",
+            )),
+        };
+
+        let tree = self.build_page_layer_tree(page_num).map_err(JsValue::from)?;
+
+        let scale = if scale <= 0.0 || scale.is_nan() {
+            1.0
+        } else {
+            scale.clamp(0.25, 12.0)
+        };
+        let max_dim = 16384.0;
+        let scale = if tree.page_width * scale > max_dim || tree.page_height * scale > max_dim {
+            (max_dim / tree.page_width)
+                .min(max_dim / tree.page_height)
+                .min(scale)
+        } else {
+            scale
+        };
+
+        canvas.set_width((tree.page_width * scale) as u32);
+        canvas.set_height((tree.page_height * scale) as u32);
+
+        let mut renderer = WebCanvasRenderer::new(canvas)?;
+        renderer.show_paragraph_marks = self.show_paragraph_marks;
+        renderer.show_control_codes = self.show_control_codes;
+        renderer.set_scale(scale);
+        renderer.set_layer_filter(filter);
+        renderer.render_page(&tree).map_err(JsValue::from)?;
+        Ok(())
+    }
+
+    /// 특정 페이지를 기존 PageRenderTree 경로로 Canvas 2D에 직접 렌더링한다.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = renderPageToCanvasLegacy)]
+    pub fn render_page_to_canvas_legacy(
+        &self,
+        page_num: u32,
+        canvas: &HtmlCanvasElement,
+        scale: f64,
+    ) -> Result<(), JsValue> {
+        use crate::renderer::web_canvas::WebCanvasRenderer;
+
+        let tree = self
+            .build_page_tree_cached(page_num)
+            .map_err(|e| JsValue::from(e))?;
+
+        // scale 정규화: 0 이하 또는 NaN이면 1.0, 최소 0.25 최대 12.0
+        // (zoom 3.0 × DPR 4.0 = 12.0 지원)
+        let scale = if scale <= 0.0 || scale.is_nan() {
+            1.0
+        } else {
+            scale.clamp(0.25, 12.0)
+        };
+
+        // 최대 캔버스 크기 가드 (16384px)
+        let max_dim = 16384.0;
+        let scale =
+            if tree.root.bbox.width * scale > max_dim || tree.root.bbox.height * scale > max_dim {
+                (max_dim / tree.root.bbox.width)
+                    .min(max_dim / tree.root.bbox.height)
+                    .min(scale)
+            } else {
+                scale
+            };
 
         // 캔버스 크기 = 페이지 크기 × scale
         canvas.set_width((tree.root.bbox.width * scale) as u32);
@@ -257,8 +355,17 @@ impl HwpDocument {
     /// 페이지 렌더 트리를 JSON 문자열로 반환한다.
     #[wasm_bindgen(js_name = getPageRenderTree)]
     pub fn get_page_render_tree(&self, page_num: u32) -> Result<String, JsValue> {
-        let tree = self.build_page_tree_cached(page_num).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let tree = self
+            .build_page_tree_cached(page_num)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(tree.root.to_json())
+    }
+
+    /// 페이지 레이어 트리를 JSON 문자열로 반환한다.
+    #[wasm_bindgen(js_name = getPageLayerTree)]
+    pub fn get_page_layer_tree(&self, page_num: u32) -> Result<String, JsValue> {
+        self.get_page_layer_tree_native(page_num)
+            .map_err(|e| e.into())
     }
 
     /// 페이지 정보를 JSON 문자열로 반환한다.
@@ -270,25 +377,29 @@ impl HwpDocument {
     /// 구역의 용지 설정(PageDef)을 HWPUNIT 원본값으로 반환한다.
     #[wasm_bindgen(js_name = getPageDef)]
     pub fn get_page_def(&self, section_idx: u32) -> Result<String, JsValue> {
-        self.get_page_def_native(section_idx as usize).map_err(|e| e.into())
+        self.get_page_def_native(section_idx as usize)
+            .map_err(|e| e.into())
     }
 
     /// 구역의 용지 설정(PageDef)을 변경하고 재페이지네이션한다.
     #[wasm_bindgen(js_name = setPageDef)]
     pub fn set_page_def(&mut self, section_idx: u32, json: &str) -> Result<String, JsValue> {
-        self.set_page_def_native(section_idx as usize, json).map_err(|e| e.into())
+        self.set_page_def_native(section_idx as usize, json)
+            .map_err(|e| e.into())
     }
 
     /// 구역 정의(SectionDef)를 JSON으로 반환한다.
     #[wasm_bindgen(js_name = getSectionDef)]
     pub fn get_section_def(&self, section_idx: u32) -> Result<String, JsValue> {
-        self.get_section_def_native(section_idx as usize).map_err(|e| e.into())
+        self.get_section_def_native(section_idx as usize)
+            .map_err(|e| e.into())
     }
 
     /// 구역 정의(SectionDef)를 변경하고 재페이지네이션한다.
     #[wasm_bindgen(js_name = setSectionDef)]
     pub fn set_section_def(&mut self, section_idx: u32, json: &str) -> Result<String, JsValue> {
-        self.set_section_def_native(section_idx as usize, json).map_err(|e| e.into())
+        self.set_section_def_native(section_idx as usize, json)
+            .map_err(|e| e.into())
     }
 
     /// 모든 구역의 SectionDef를 일괄 변경하고 재페이지네이션한다.
@@ -308,13 +419,15 @@ impl HwpDocument {
     /// 각 TextRun의 위치, 텍스트, 글자별 X 좌표 경계값을 포함한다.
     #[wasm_bindgen(js_name = getPageTextLayout)]
     pub fn get_page_text_layout(&self, page_num: u32) -> Result<String, JsValue> {
-        self.get_page_text_layout_native(page_num).map_err(|e| e.into())
+        self.get_page_text_layout_native(page_num)
+            .map_err(|e| e.into())
     }
 
     /// 컨트롤(표, 이미지 등) 레이아웃 정보를 반환한다.
     #[wasm_bindgen(js_name = getPageControlLayout)]
     pub fn get_page_control_layout(&self, page_num: u32) -> Result<String, JsValue> {
-        self.get_page_control_layout_native(page_num).map_err(|e| e.into())
+        self.get_page_control_layout_native(page_num)
+            .map_err(|e| e.into())
     }
 
     /// DPI를 설정한다.
@@ -341,13 +454,6 @@ impl HwpDocument {
         self.fallback_font = path.to_string();
     }
 
-    /// 현재 문서를 강제로 재조판한다.
-    /// 폰트 로딩 완료 직후/대형 도형 배치 변경 직후 호출해 페이지 밀림을 줄인다.
-    #[wasm_bindgen(js_name = refreshLayout)]
-    pub fn refresh_layout(&mut self) {
-        self.core.paginate();
-    }
-
     /// 현재 대체 폰트 경로를 반환한다.
     #[wasm_bindgen(js_name = getFallbackFont)]
     pub fn get_fallback_font(&self) -> String {
@@ -366,8 +472,13 @@ impl HwpDocument {
         char_offset: u32,
         text: &str,
     ) -> Result<String, JsValue> {
-        self.insert_text_native(section_idx as usize, para_idx as usize, char_offset as usize, text)
-            .map_err(|e| e.into())
+        self.insert_text_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 논리적 오프셋으로 텍스트를 삽입한다.
@@ -386,16 +497,21 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         let sec = section_idx as usize;
         let pi = para_idx as usize;
-        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len() {
+        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len()
+        {
             return Err(JsValue::from_str("인덱스 범위 초과"));
         }
         let (text_offset, _) = crate::document_core::helpers::logical_to_text_offset(
-            &self.document.sections[sec].paragraphs[pi], logical_offset as usize);
+            &self.document.sections[sec].paragraphs[pi],
+            logical_offset as usize,
+        );
         let result = self.insert_text_native(sec, pi, text_offset, text)?;
         // 삽입 후 논리적 오프셋 반환
         let new_text_offset = text_offset + text.chars().count();
         let new_logical = crate::document_core::helpers::text_to_logical_offset(
-            &self.document.sections[sec].paragraphs[pi], new_text_offset);
+            &self.document.sections[sec].paragraphs[pi],
+            new_text_offset,
+        );
         Ok(format!("{{\"ok\":true,\"logicalOffset\":{}}}", new_logical))
     }
 
@@ -404,36 +520,54 @@ impl HwpDocument {
     pub fn get_logical_length(&self, section_idx: u32, para_idx: u32) -> Result<u32, JsValue> {
         let sec = section_idx as usize;
         let pi = para_idx as usize;
-        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len() {
+        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len()
+        {
             return Err(JsValue::from_str("인덱스 범위 초과"));
         }
         Ok(crate::document_core::helpers::logical_paragraph_length(
-            &self.document.sections[sec].paragraphs[pi]) as u32)
+            &self.document.sections[sec].paragraphs[pi],
+        ) as u32)
     }
 
     /// 논리적 오프셋 → 텍스트 오프셋 변환.
     #[wasm_bindgen(js_name = logicalToTextOffset)]
-    pub fn logical_to_text_offset(&self, section_idx: u32, para_idx: u32, logical_offset: u32) -> Result<u32, JsValue> {
+    pub fn logical_to_text_offset(
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        logical_offset: u32,
+    ) -> Result<u32, JsValue> {
         let sec = section_idx as usize;
         let pi = para_idx as usize;
-        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len() {
+        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len()
+        {
             return Err(JsValue::from_str("인덱스 범위 초과"));
         }
         let (text_offset, _) = crate::document_core::helpers::logical_to_text_offset(
-            &self.document.sections[sec].paragraphs[pi], logical_offset as usize);
+            &self.document.sections[sec].paragraphs[pi],
+            logical_offset as usize,
+        );
         Ok(text_offset as u32)
     }
 
     /// 텍스트 오프셋 → 논리적 오프셋 변환.
     #[wasm_bindgen(js_name = textToLogicalOffset)]
-    pub fn text_to_logical_offset(&self, section_idx: u32, para_idx: u32, text_offset: u32) -> Result<u32, JsValue> {
+    pub fn text_to_logical_offset(
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        text_offset: u32,
+    ) -> Result<u32, JsValue> {
         let sec = section_idx as usize;
         let pi = para_idx as usize;
-        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len() {
+        if sec >= self.document.sections.len() || pi >= self.document.sections[sec].paragraphs.len()
+        {
             return Err(JsValue::from_str("인덱스 범위 초과"));
         }
         Ok(crate::document_core::helpers::text_to_logical_offset(
-            &self.document.sections[sec].paragraphs[pi], text_offset as usize) as u32)
+            &self.document.sections[sec].paragraphs[pi],
+            text_offset as usize,
+        ) as u32)
     }
 
     /// 문단에서 텍스트를 삭제한다.
@@ -448,8 +582,13 @@ impl HwpDocument {
         char_offset: u32,
         count: u32,
     ) -> Result<String, JsValue> {
-        self.delete_text_native(section_idx as usize, para_idx as usize, char_offset as usize, count as usize)
-            .map_err(|e| e.into())
+        self.delete_text_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀 내부 문단에 텍스트를 삽입한다.
@@ -467,10 +606,15 @@ impl HwpDocument {
         text: &str,
     ) -> Result<String, JsValue> {
         self.insert_text_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize, text,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀 내부 문단에서 텍스트를 삭제한다.
@@ -488,10 +632,15 @@ impl HwpDocument {
         count: u32,
     ) -> Result<String, JsValue> {
         self.delete_text_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 내부 문단을 분할한다 (셀 내 Enter 키).
@@ -508,10 +657,14 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.split_paragraph_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 내부 문단을 이전 문단에 병합한다 (셀 내 Backspace at start).
@@ -527,62 +680,105 @@ impl HwpDocument {
         cell_para_idx: u32,
     ) -> Result<String, JsValue> {
         self.merge_paragraph_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
             cell_para_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── 중첩 표 path 기반 편집 API ──────────────────────────
 
     #[wasm_bindgen(js_name = insertTextInCellByPath)]
     pub fn insert_text_in_cell_by_path_api(
-        &mut self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32, text: &str,
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
+        text: &str,
     ) -> Result<String, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
         self.insert_text_in_cell_by_path(
-            section_idx as usize, parent_para_idx as usize, &path, char_offset as usize, text,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            &path,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
     }
 
     #[wasm_bindgen(js_name = deleteTextInCellByPath)]
     pub fn delete_text_in_cell_by_path_api(
-        &mut self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32, count: u32,
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
+        count: u32,
     ) -> Result<String, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
         self.delete_text_in_cell_by_path(
-            section_idx as usize, parent_para_idx as usize, &path, char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            &path,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     #[wasm_bindgen(js_name = splitParagraphInCellByPath)]
     pub fn split_paragraph_in_cell_by_path_api(
-        &mut self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32,
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
     ) -> Result<String, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
         self.split_paragraph_in_cell_by_path(
-            section_idx as usize, parent_para_idx as usize, &path, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            &path,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     #[wasm_bindgen(js_name = mergeParagraphInCellByPath)]
     pub fn merge_paragraph_in_cell_by_path_api(
-        &mut self, section_idx: u32, parent_para_idx: u32, path_json: &str,
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
     ) -> Result<String, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
-        self.merge_paragraph_in_cell_by_path(
-            section_idx as usize, parent_para_idx as usize, &path,
-        ).map_err(|e| e.into())
+        self.merge_paragraph_in_cell_by_path(section_idx as usize, parent_para_idx as usize, &path)
+            .map_err(|e| e.into())
     }
 
     #[wasm_bindgen(js_name = getTextInCellByPath)]
     pub fn get_text_in_cell_by_path_api(
-        &self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32, count: u32,
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
+        count: u32,
     ) -> Result<String, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
         self.get_text_in_cell_by_path(
-            section_idx as usize, parent_para_idx as usize, &path, char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            &path,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── 머리말/꼬리말 API ──────────────────────────────────
@@ -629,9 +825,14 @@ impl HwpDocument {
         text: &str,
     ) -> Result<String, JsValue> {
         self.insert_text_in_header_footer_native(
-            section_idx as usize, is_header, apply_to,
-            hf_para_idx as usize, char_offset as usize, text,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            is_header,
+            apply_to,
+            hf_para_idx as usize,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 내 텍스트 삭제
@@ -648,9 +849,14 @@ impl HwpDocument {
         count: u32,
     ) -> Result<String, JsValue> {
         self.delete_text_in_header_footer_native(
-            section_idx as usize, is_header, apply_to,
-            hf_para_idx as usize, char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            is_header,
+            apply_to,
+            hf_para_idx as usize,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 내 문단 분할 (Enter 키)
@@ -666,9 +872,13 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.split_paragraph_in_header_footer_native(
-            section_idx as usize, is_header, apply_to,
-            hf_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            is_header,
+            apply_to,
+            hf_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 내 문단 병합 (Backspace at start)
@@ -683,9 +893,12 @@ impl HwpDocument {
         hf_para_idx: u32,
     ) -> Result<String, JsValue> {
         self.merge_paragraph_in_header_footer_native(
-            section_idx as usize, is_header, apply_to,
+            section_idx as usize,
+            is_header,
+            apply_to,
             hf_para_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 문단 정보 조회
@@ -700,9 +913,12 @@ impl HwpDocument {
         hf_para_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_header_footer_para_info_native(
-            section_idx as usize, is_header, apply_to,
+            section_idx as usize,
+            is_header,
+            apply_to,
             hf_para_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표에 행을 삽입한다.
@@ -718,9 +934,13 @@ impl HwpDocument {
         below: bool,
     ) -> Result<String, JsValue> {
         self.insert_table_row_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, row_idx as u16, below,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            row_idx as u16,
+            below,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표에 열을 삽입한다.
@@ -736,9 +956,13 @@ impl HwpDocument {
         right: bool,
     ) -> Result<String, JsValue> {
         self.insert_table_column_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, col_idx as u16, right,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            col_idx as u16,
+            right,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표에서 행을 삭제한다.
@@ -753,9 +977,12 @@ impl HwpDocument {
         row_idx: u32,
     ) -> Result<String, JsValue> {
         self.delete_table_row_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, row_idx as u16,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            row_idx as u16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표에서 열을 삭제한다.
@@ -770,9 +997,12 @@ impl HwpDocument {
         col_idx: u32,
     ) -> Result<String, JsValue> {
         self.delete_table_column_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, col_idx as u16,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            col_idx as u16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표의 셀을 병합한다.
@@ -790,11 +1020,15 @@ impl HwpDocument {
         end_col: u32,
     ) -> Result<String, JsValue> {
         self.merge_table_cells_native(
-            section_idx as usize, parent_para_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
             control_idx as usize,
-            start_row as u16, start_col as u16,
-            end_row as u16, end_col as u16,
-        ).map_err(|e| e.into())
+            start_row as u16,
+            start_col as u16,
+            end_row as u16,
+            end_col as u16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 병합된 셀을 나눈다 (split).
@@ -810,10 +1044,13 @@ impl HwpDocument {
         col: u32,
     ) -> Result<String, JsValue> {
         self.split_table_cell_native(
-            section_idx as usize, parent_para_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
             control_idx as usize,
-            row as u16, col as u16,
-        ).map_err(|e| e.into())
+            row as u16,
+            col as u16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀을 N줄 × M칸으로 분할한다.
@@ -833,12 +1070,17 @@ impl HwpDocument {
         merge_first: bool,
     ) -> Result<String, JsValue> {
         self.split_table_cell_into_native(
-            section_idx as usize, parent_para_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
             control_idx as usize,
-            row as u16, col as u16,
-            n_rows as u16, m_cols as u16,
-            equal_row_height, merge_first,
-        ).map_err(|e| e.into())
+            row as u16,
+            col as u16,
+            n_rows as u16,
+            m_cols as u16,
+            equal_row_height,
+            merge_first,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 범위 내 셀들을 각각 N줄 × M칸으로 분할한다.
@@ -859,13 +1101,18 @@ impl HwpDocument {
         equal_row_height: bool,
     ) -> Result<String, JsValue> {
         self.split_table_cells_in_range_native(
-            section_idx as usize, parent_para_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
             control_idx as usize,
-            start_row as u16, start_col as u16,
-            end_row as u16, end_col as u16,
-            n_rows as u16, m_cols as u16,
+            start_row as u16,
+            start_col as u16,
+            end_row as u16,
+            end_col as u16,
+            n_rows as u16,
+            m_cols as u16,
             equal_row_height,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 캐럿 위치에서 문단을 분할한다 (Enter 키).
@@ -879,29 +1126,44 @@ impl HwpDocument {
         para_idx: u32,
         char_offset: u32,
     ) -> Result<String, JsValue> {
-        let out = self.split_paragraph_native(section_idx as usize, para_idx as usize, char_offset as usize)
-            .map_err(JsValue::from)?;
-        // split 후 새 문단은 새 ID를 가져야 한다.
-        self.ensure_paragraph_stable_ids();
-        Ok(out)
+        self.split_paragraph_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 강제 쪽 나누기 삽입 (Ctrl+Enter)
     #[wasm_bindgen(js_name = insertPageBreak)]
     pub fn insert_page_break(
-        &mut self, section_idx: u32, para_idx: u32, char_offset: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
     ) -> Result<String, JsValue> {
-        self.insert_page_break_native(section_idx as usize, para_idx as usize, char_offset as usize)
-            .map_err(|e| e.into())
+        self.insert_page_break_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 단 나누기 삽입 (Ctrl+Shift+Enter)
     #[wasm_bindgen(js_name = insertColumnBreak)]
     pub fn insert_column_break(
-        &mut self, section_idx: u32, para_idx: u32, char_offset: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
     ) -> Result<String, JsValue> {
-        self.insert_column_break_native(section_idx as usize, para_idx as usize, char_offset as usize)
-            .map_err(|e| e.into())
+        self.insert_column_break_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 다단 설정 변경
@@ -909,15 +1171,21 @@ impl HwpDocument {
     /// same_width: 0=다른 너비, 1=같은 너비
     #[wasm_bindgen(js_name = setColumnDef)]
     pub fn set_column_def(
-        &mut self, section_idx: u32,
-        column_count: u32, column_type: u32,
-        same_width: u32, spacing_hu: i32,
+        &mut self,
+        section_idx: u32,
+        column_count: u32,
+        column_type: u32,
+        same_width: u32,
+        spacing_hu: i32,
     ) -> Result<String, JsValue> {
         self.set_column_def_native(
             section_idx as usize,
-            column_count as u16, column_type as u8,
-            same_width != 0, spacing_hu as i16,
-        ).map_err(|e| e.into())
+            column_count as u16,
+            column_type as u8,
+            same_width != 0,
+            spacing_hu as i16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 현재 문단을 이전 문단에 병합한다 (Backspace at start).
@@ -925,16 +1193,21 @@ impl HwpDocument {
     /// para_idx의 텍스트가 para_idx-1에 결합되고 para_idx는 삭제된다.
     /// 반환값: JSON `{"ok":true,"paraIdx":<merged_para_idx>,"charOffset":<merge_point>}`
     #[wasm_bindgen(js_name = mergeParagraph)]
-    pub fn merge_paragraph(
-        &mut self,
-        section_idx: u32,
-        para_idx: u32,
-    ) -> Result<String, JsValue> {
-        let out = self.merge_paragraph_native(section_idx as usize, para_idx as usize)
-            .map_err(JsValue::from)?;
-        // merge 후 ID 중복/빈값 방지 정리.
-        self.ensure_paragraph_stable_ids();
-        Ok(out)
+    pub fn merge_paragraph(&mut self, section_idx: u32, para_idx: u32) -> Result<String, JsValue> {
+        self.merge_paragraph_native(section_idx as usize, para_idx as usize)
+            .map_err(|e| e.into())
+    }
+
+    #[wasm_bindgen(js_name = deleteParagraph)]
+    pub fn delete_paragraph(&mut self, section_idx: u32, para_idx: u32) -> Result<String, JsValue> {
+        self.delete_paragraph_native(section_idx as usize, para_idx as usize)
+            .map_err(|e| e.into())
+    }
+
+    #[wasm_bindgen(js_name = insertParagraph)]
+    pub fn insert_paragraph(&mut self, section_idx: u32, para_idx: u32) -> Result<String, JsValue> {
+        self.insert_paragraph_native(section_idx as usize, para_idx as usize)
+            .map_err(|e| e.into())
     }
 
     // ─── Phase 1: 기본 편집 보조 API ───────────────────────────
@@ -961,77 +1234,6 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
-    /// [이력관리 확장] 문단의 stable_id를 반환한다.
-    /// 원본 오픈소스 기본 API에는 없던 비교 추적성용 공개 경로.
-    ///
-    /// 목적:
-    /// - TS diff 엔진이 문단 정체성을 위치(section/paragraph index)가 아닌
-    ///   stable_id로 매칭할 수 있게 한다.
-    /// - 같은 문서의 시계열 비교에서 "수정/추가/삭제"를 더 정확히 분리한다.
-    #[wasm_bindgen(js_name = getParagraphStableId)]
-    pub fn get_paragraph_stable_id(&self, section_idx: u32, para_idx: u32) -> String {
-        let sec_i = section_idx as usize;
-        let para_i = para_idx as usize;
-        if let Some(sec) = self.document.sections.get(sec_i) {
-            if let Some(para) = sec.paragraphs.get(para_i) {
-                return para.stable_id.clone();
-            }
-        }
-        String::new()
-    }
-
-    /// [이력관리 확장] 문서 내 문단 stable_id 무결성 보정.
-    ///
-    /// 정책:
-    /// 1) 빈 ID만 발급 (기존 ID는 보존)
-    /// 2) 중복 ID는 신규 sid로 치환
-    ///
-    /// 기대효과:
-    /// - split/merge/copy-paste 이후에도 문서 내 sid 고유성 유지
-    /// - TS identity 비교(Map<sid>)가 실패하지 않도록 보장
-    #[wasm_bindgen(js_name = ensureParagraphStableIds)]
-    pub fn ensure_paragraph_stable_ids(&mut self) {
-        // 1) 빈 ID 채우기
-        for sec in &mut self.document.sections {
-            for para in &mut sec.paragraphs {
-                if para.stable_id.is_empty() {
-                    para.stable_id = generate_paragraph_stable_id();
-                }
-            }
-        }
-        // 2) 중복 ID 정리 (복붙 등으로 동일 ID가 복제된 경우)
-        let mut seen: HashSet<String> = HashSet::new();
-        for sec in &mut self.document.sections {
-            for para in &mut sec.paragraphs {
-                if seen.contains(&para.stable_id) {
-                    para.stable_id = generate_paragraph_stable_id();
-                }
-                seen.insert(para.stable_id.clone());
-            }
-        }
-    }
-
-    /// [이력관리 확장] 디버그: 문단 stable_id 일부를 JSON 배열로 반환한다.
-    ///
-    /// 사용처:
-    /// - 프론트 콘솔에서 sid 분포/중복/빈값 여부를 빠르게 확인
-    /// - "왜 alignment로 폴백됐는지" 원인 추적 시 진단 도구로 사용
-    #[wasm_bindgen(js_name = debugDumpStableIds)]
-    pub fn debug_dump_stable_ids(&self, section_idx: u32, start_para: u32, count: u32) -> String {
-        let sec_i = section_idx as usize;
-        let start = start_para as usize;
-        let end = start.saturating_add(count as usize);
-        let Some(sec) = self.document.sections.get(sec_i) else {
-            return "[]".to_string();
-        };
-        let mut out: Vec<String> = Vec::new();
-        for pi in start..end.min(sec.paragraphs.len()) {
-            let id = sec.paragraphs[pi].stable_id.clone();
-            out.push(format!("{{\"sec\":{},\"para\":{},\"id\":\"{}\"}}", sec_i, pi, id));
-        }
-        format!("[{}]", out.join(","))
-    }
-
     /// 문단에 텍스트박스가 있는 Shape 컨트롤이 있으면 해당 control_index를 반환한다.
     /// 없으면 -1을 반환한다.
     #[wasm_bindgen(js_name = getTextBoxControlIndex)]
@@ -1043,30 +1245,47 @@ impl HwpDocument {
     /// delta=+1(앞), delta=-1(뒤). ctrl_idx=-1이면 본문 텍스트에서 출발.
     #[wasm_bindgen(js_name = findNextEditableControl)]
     pub fn find_next_editable_control(
-        &self, section_idx: u32, para_idx: u32, ctrl_idx: i32, delta: i32,
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        ctrl_idx: i32,
+        delta: i32,
     ) -> String {
         self.find_next_editable_control_native(
-            section_idx as usize, para_idx as usize, ctrl_idx, delta,
+            section_idx as usize,
+            para_idx as usize,
+            ctrl_idx,
+            delta,
         )
     }
 
     /// 커서에서 이전 방향으로 가장 가까운 선택 가능 컨트롤을 찾는다 (F11 키).
     #[wasm_bindgen(js_name = findNearestControlBackward)]
     pub fn find_nearest_control_backward(
-        &self, section_idx: u32, para_idx: u32, char_offset: u32,
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
     ) -> String {
         self.find_nearest_control_backward_native(
-            section_idx as usize, para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
         )
     }
 
     /// 현재 위치 이후의 가장 가까운 선택 가능 컨트롤을 찾는다 (Shift+F11).
     #[wasm_bindgen(js_name = findNearestControlForward)]
     pub fn find_nearest_control_forward(
-        &self, section_idx: u32, para_idx: u32, char_offset: u32,
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
     ) -> String {
         self.find_nearest_control_forward_native(
-            section_idx as usize, para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
         )
     }
 
@@ -1077,7 +1296,14 @@ impl HwpDocument {
         if let Some(sec) = sections.get(section_idx as usize) {
             if let Some(para) = sec.paragraphs.get(para_idx as usize) {
                 let positions = crate::document_core::find_control_text_positions(para);
-                return format!("[{}]", positions.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
+                return format!(
+                    "[{}]",
+                    positions
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
             }
         }
         "[]".to_string()
@@ -1087,12 +1313,19 @@ impl HwpDocument {
     /// context_json: NavContextEntry 배열의 JSON (빈 배열 "[]" = body)
     #[wasm_bindgen(js_name = navigateNextEditable)]
     pub fn navigate_next_editable_wasm(
-        &self, sec: u32, para: u32, char_offset: u32, delta: i32, context_json: &str,
+        &self,
+        sec: u32,
+        para: u32,
+        char_offset: u32,
+        delta: i32,
+        context_json: &str,
     ) -> String {
         let raw_context = DocumentCore::parse_nav_context(context_json);
         // TypeScript에서 ctrl_text_pos=0으로 전달되므로 실제 값으로 보정
         let context = DocumentCore::fix_context_text_positions(
-            &self.core.document.sections, sec as usize, &raw_context,
+            &self.core.document.sections,
+            sec as usize,
+            &raw_context,
         );
 
         // 오버플로우 링크 계산 (캐시됨)
@@ -1102,15 +1335,23 @@ impl HwpDocument {
         let max_para = if !context.is_empty() {
             let last = &context[context.len() - 1];
             self.core.last_rendered_para_in_container(
-                sec as usize, last.parent_para, last.ctrl_idx, last.cell_idx,
+                sec as usize,
+                last.parent_para,
+                last.ctrl_idx,
+                last.cell_idx,
             )
         } else {
             None
         };
 
         let result = self.core.navigate_next_editable(
-            sec as usize, para as usize, char_offset as usize, delta,
-            &context, max_para, &overflow_links,
+            sec as usize,
+            para as usize,
+            char_offset as usize,
+            delta,
+            &context,
+            max_para,
+            &overflow_links,
         );
         DocumentCore::nav_result_to_json(&result)
     }
@@ -1125,9 +1366,12 @@ impl HwpDocument {
         count: u32,
     ) -> Result<String, JsValue> {
         self.get_text_range_native(
-            section_idx as usize, para_idx as usize,
-            char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀 내 문단 수를 반환한다.
@@ -1140,9 +1384,12 @@ impl HwpDocument {
         cell_idx: u32,
     ) -> Result<u32, JsValue> {
         self.get_cell_paragraph_count_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-        ).map(|v| v as u32)
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+        )
+        .map(|v| v as u32)
         .map_err(|e| e.into())
     }
 
@@ -1157,10 +1404,13 @@ impl HwpDocument {
         cell_para_idx: u32,
     ) -> Result<u32, JsValue> {
         self.get_cell_paragraph_length_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
             cell_para_idx as usize,
-        ).map(|v| v as u32)
+        )
+        .map(|v| v as u32)
         .map_err(|e| e.into())
     }
 
@@ -1173,9 +1423,13 @@ impl HwpDocument {
         path_json: &str,
     ) -> Result<u32, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
-        let count = self.resolve_container_para_count_by_path(
-            section_idx as usize, parent_para_idx as usize, &path,
-        ).map_err(|e| -> JsValue { e.into() })?;
+        let count = self
+            .resolve_container_para_count_by_path(
+                section_idx as usize,
+                parent_para_idx as usize,
+                &path,
+            )
+            .map_err(|e| -> JsValue { e.into() })?;
         Ok(count as u32)
     }
 
@@ -1188,9 +1442,9 @@ impl HwpDocument {
         path_json: &str,
     ) -> Result<u32, JsValue> {
         let path = DocumentCore::parse_cell_path(path_json)?;
-        let para = self.resolve_paragraph_by_path(
-            section_idx as usize, parent_para_idx as usize, &path,
-        ).map_err(|e| -> JsValue { e.into() })?;
+        let para = self
+            .resolve_paragraph_by_path(section_idx as usize, parent_para_idx as usize, &path)
+            .map_err(|e| -> JsValue { e.into() })?;
         Ok(para.text.chars().count() as u32)
     }
 
@@ -1203,13 +1457,19 @@ impl HwpDocument {
         control_idx: u32,
         cell_idx: u32,
     ) -> Result<u32, JsValue> {
-        let para = self.document.sections.get(section_idx as usize)
+        let para = self
+            .document
+            .sections
+            .get(section_idx as usize)
             .ok_or_else(|| JsValue::from_str("구역 인덱스 범위 초과"))?
-            .paragraphs.get(parent_para_idx as usize)
+            .paragraphs
+            .get(parent_para_idx as usize)
             .ok_or_else(|| JsValue::from_str("문단 인덱스 범위 초과"))?;
         match para.controls.get(control_idx as usize) {
             Some(Control::Table(table)) => {
-                let cell = table.cells.get(cell_idx as usize)
+                let cell = table
+                    .cells
+                    .get(cell_idx as usize)
                     .ok_or_else(|| JsValue::from_str("셀 인덱스 범위 초과"))?;
                 Ok(cell.text_direction as u32)
             }
@@ -1230,11 +1490,15 @@ impl HwpDocument {
         count: u32,
     ) -> Result<String, JsValue> {
         self.get_text_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
             count as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── Phase 1 끝 ─────────────────────────────────────────
@@ -1255,19 +1519,15 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 페이지 좌표에서 문서 위치를 찾는다.
     ///
     /// 반환: JSON `{"sectionIndex":N,"paragraphIndex":N,"charOffset":N}`
     #[wasm_bindgen(js_name = hitTest)]
-    pub fn hit_test(
-        &self,
-        page_num: u32,
-        x: f64,
-        y: f64,
-    ) -> Result<String, JsValue> {
+    pub fn hit_test(&self, page_num: u32, x: f64, y: f64) -> Result<String, JsValue> {
         self.hit_test_native(page_num, x, y).map_err(|e| e.into())
     }
 
@@ -1286,23 +1546,23 @@ impl HwpDocument {
         preferred_page: i32,
     ) -> Result<String, JsValue> {
         self.get_cursor_rect_in_header_footer_native(
-            section_idx as usize, is_header, apply_to,
-            hf_para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            is_header,
+            apply_to,
+            hf_para_idx as usize,
+            char_offset as usize,
             preferred_page,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 페이지 좌표가 머리말/꼬리말 영역에 해당하는지 판별한다.
     ///
     /// 반환: JSON `{"hit":true/false,"isHeader":bool,"sectionIndex":N,"applyTo":N}`
     #[wasm_bindgen(js_name = hitTestHeaderFooter)]
-    pub fn hit_test_header_footer(
-        &self,
-        page_num: u32,
-        x: f64,
-        y: f64,
-    ) -> Result<String, JsValue> {
-        self.hit_test_header_footer_native(page_num, x, y).map_err(|e| e.into())
+    pub fn hit_test_header_footer(&self, page_num: u32, x: f64, y: f64) -> Result<String, JsValue> {
+        self.hit_test_header_footer_native(page_num, x, y)
+            .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 내부 텍스트 히트테스트.
@@ -1344,8 +1604,14 @@ impl HwpDocument {
         hf_para_idx: usize,
         props_json: &str,
     ) -> Result<String, JsValue> {
-        self.apply_para_format_in_hf_native(section_idx, is_header, apply_to, hf_para_idx, props_json)
-            .map_err(|e| e.into())
+        self.apply_para_format_in_hf_native(
+            section_idx,
+            is_header,
+            apply_to,
+            hf_para_idx,
+            props_json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 문단에 필드 마커를 삽입한다.
@@ -1359,8 +1625,15 @@ impl HwpDocument {
         char_offset: usize,
         field_type: u8,
     ) -> Result<String, JsValue> {
-        self.insert_field_in_hf_native(section_idx, is_header, apply_to, hf_para_idx, char_offset, field_type)
-            .map_err(|e| e.into())
+        self.insert_field_in_hf_native(
+            section_idx,
+            is_header,
+            apply_to,
+            hf_para_idx,
+            char_offset,
+            field_type,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 머리말/꼬리말 마당(템플릿)을 적용한다.
@@ -1400,7 +1673,8 @@ impl HwpDocument {
             current_section_idx as usize,
             current_is_header,
             current_apply_to as u8,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 페이지 단위로 이전/다음 머리말·꼬리말로 이동한다.
@@ -1445,10 +1719,14 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.get_cursor_rect_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── Phase 3: 커서 이동 API ──────────────────────────────
@@ -1464,8 +1742,11 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.get_line_info_native(
-            section_idx as usize, para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀 내 문단의 줄 정보를 반환한다.
@@ -1482,10 +1763,14 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.get_line_info_in_cell_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 문서에 저장된 캐럿 위치를 반환한다 (문서 로딩 시 캐럿 자동 배치용).
@@ -1507,8 +1792,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_table_dimensions_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀의 행/열/병합 정보를 반환한다.
@@ -1523,9 +1811,12 @@ impl HwpDocument {
         cell_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_cell_info_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 속성을 조회한다.
@@ -1540,9 +1831,12 @@ impl HwpDocument {
         cell_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_cell_properties_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 속성을 수정한다.
@@ -1558,9 +1852,13 @@ impl HwpDocument {
         json: &str,
     ) -> Result<String, JsValue> {
         self.set_cell_properties_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize, json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 여러 셀의 width/height를 한 번에 조절한다 (배치).
@@ -1576,9 +1874,12 @@ impl HwpDocument {
         json: &str,
     ) -> Result<String, JsValue> {
         self.resize_table_cells_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표의 위치 오프셋(vertical_offset, horizontal_offset)을 이동한다.
@@ -1595,9 +1896,13 @@ impl HwpDocument {
         delta_v: i32,
     ) -> Result<String, JsValue> {
         self.move_table_offset_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, delta_h, delta_v,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            delta_h,
+            delta_v,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 속성을 조회한다.
@@ -1611,60 +1916,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_table_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
-    }
-
-    /// 표의 구조/속성/셀 텍스트를 포함한 비교용 시그니처를 반환한다.
-    ///
-    /// 반환: JSON
-    /// `{"rowCount":..,"colCount":..,"cellCount":..,"props":"..","cells":[..]}`
-    #[wasm_bindgen(js_name = getTableSignature)]
-    pub fn get_table_signature(
-        &self,
-        section_idx: u32,
-        parent_para_idx: u32,
-        control_idx: u32,
-    ) -> Result<String, JsValue> {
-        let sec = self.document.sections.get(section_idx as usize)
-            .ok_or_else(|| JsValue::from_str("구역 인덱스 범위 초과"))?;
-        let para = sec.paragraphs.get(parent_para_idx as usize)
-            .ok_or_else(|| JsValue::from_str("문단 인덱스 범위 초과"))?;
-        let table = match para.controls.get(control_idx as usize) {
-            Some(Control::Table(t)) => t,
-            _ => return Err(JsValue::from_str("해당 control_idx가 표가 아닙니다")),
-        };
-
-        let mut cells_json: Vec<String> = Vec::with_capacity(table.cells.len());
-        for cell in &table.cells {
-            let mut paras_json: Vec<String> = Vec::with_capacity(cell.paragraphs.len());
-            for p in &cell.paragraphs {
-                let t = p.text.replace('\u{000d}', "");
-                paras_json.push(format!("\"{}\"", json_escape(&t)));
-            }
-            cells_json.push(format!(
-                "{{\"row\":{},\"col\":{},\"rowSpan\":{},\"colSpan\":{},\"textDirection\":{},\"paras\":[{}]}}",
-                cell.row,
-                cell.col,
-                cell.row_span,
-                cell.col_span,
-                cell.text_direction as u32,
-                paras_json.join(",")
-            ));
-        }
-
-        let props = self.get_table_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).unwrap_or_else(|_| "{}".to_string());
-
-        Ok(format!(
-            "{{\"rowCount\":{},\"colCount\":{},\"cellCount\":{},\"props\":{},\"cells\":[{}]}}",
-            table.row_count,
-            table.col_count,
-            table.cells.len(),
-            props,
-            cells_json.join(",")
-        ))
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 속성을 수정한다.
@@ -1679,9 +1935,12 @@ impl HwpDocument {
         json: &str,
     ) -> Result<String, JsValue> {
         self.set_table_properties_native(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표의 모든 셀 bbox를 반환한다 (F5 셀 선택 모드용).
@@ -1696,9 +1955,12 @@ impl HwpDocument {
         page_hint: Option<u32>,
     ) -> Result<String, JsValue> {
         self.get_table_cell_bboxes_from_page(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
             page_hint.unwrap_or(0) as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 전체의 바운딩박스를 반환한다.
@@ -1712,8 +1974,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_table_bbox_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 컨트롤을 문단에서 삭제한다.
@@ -1727,8 +1992,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.delete_table_control_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 커서 위치에 새 표를 삽입한다.
@@ -1744,9 +2012,13 @@ impl HwpDocument {
         col_count: u32,
     ) -> Result<String, JsValue> {
         self.create_table_native(
-            section_idx as usize, para_idx as usize, char_offset as usize,
-            row_count as u16, col_count as u16,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            row_count as u16,
+            col_count as u16,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 커서 위치에 표를 삽입한다 (확장, JSON 옵션).
@@ -1755,7 +2027,7 @@ impl HwpDocument {
     ///                 treatAsChar?: bool, colWidths?: [u32, ...] }
     #[wasm_bindgen(js_name = createTableEx)]
     pub fn create_table_ex(&mut self, options_json: &str) -> Result<String, JsValue> {
-        use crate::document_core::helpers::{json_u32, json_bool};
+        use crate::document_core::helpers::{json_bool, json_u32};
         let section_idx = json_u32(options_json, "sectionIdx").unwrap_or(0) as usize;
         let para_idx = json_u32(options_json, "paraIdx").unwrap_or(0) as usize;
         let char_offset = json_u32(options_json, "charOffset").unwrap_or(0) as usize;
@@ -1770,20 +2042,36 @@ impl HwpDocument {
                 if let Some(arr_start) = rest.find('[') {
                     if let Some(arr_end) = rest[arr_start..].find(']') {
                         let arr_str = &rest[arr_start + 1..arr_start + arr_end];
-                        let nums: Vec<u32> = arr_str.split(',')
+                        let nums: Vec<u32> = arr_str
+                            .split(',')
                             .filter_map(|s| s.trim().parse::<u32>().ok())
                             .collect();
-                        if !nums.is_empty() { Some(nums) } else { None }
-                    } else { None }
-                } else { None }
-            } else { None }
+                        if !nums.is_empty() {
+                            Some(nums)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
         self.create_table_ex_native(
-            section_idx, para_idx, char_offset,
-            row_count, col_count, treat_as_char,
+            section_idx,
+            para_idx,
+            char_offset,
+            row_count,
+            col_count,
+            treat_as_char,
             col_widths.as_deref(),
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 커서 위치에 그림을 삽입한다.
@@ -1808,10 +2096,18 @@ impl HwpDocument {
         description: &str,
     ) -> Result<String, JsValue> {
         self.insert_picture_native(
-            section_idx as usize, para_idx as usize, char_offset as usize,
-            image_data, width, height, natural_width_px, natural_height_px,
-            extension, description,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 그림 컨트롤의 속성을 조회한다.
@@ -1825,8 +2121,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_picture_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 그림 컨트롤의 속성을 변경한다.
@@ -1841,9 +2140,12 @@ impl HwpDocument {
         props_json: &str,
     ) -> Result<String, JsValue> {
         self.set_picture_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
             props_json,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 그림 컨트롤을 문단에서 삭제한다.
@@ -1857,8 +2159,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.delete_picture_control_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── Equation(수식) API ──────────────────────────────
@@ -1875,12 +2180,24 @@ impl HwpDocument {
         cell_idx: i32,
         cell_para_idx: i32,
     ) -> Result<String, JsValue> {
-        let ci = if cell_idx >= 0 { Some(cell_idx as usize) } else { None };
-        let cpi = if cell_para_idx >= 0 { Some(cell_para_idx as usize) } else { None };
+        let ci = if cell_idx >= 0 {
+            Some(cell_idx as usize)
+        } else {
+            None
+        };
+        let cpi = if cell_para_idx >= 0 {
+            Some(cell_para_idx as usize)
+        } else {
+            None
+        };
         self.get_equation_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-            ci, cpi,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            ci,
+            cpi,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 수식 컨트롤의 속성을 변경한다.
@@ -1896,12 +2213,25 @@ impl HwpDocument {
         cell_para_idx: i32,
         props_json: &str,
     ) -> Result<String, JsValue> {
-        let ci = if cell_idx >= 0 { Some(cell_idx as usize) } else { None };
-        let cpi = if cell_para_idx >= 0 { Some(cell_para_idx as usize) } else { None };
+        let ci = if cell_idx >= 0 {
+            Some(cell_idx as usize)
+        } else {
+            None
+        };
+        let cpi = if cell_para_idx >= 0 {
+            Some(cell_para_idx as usize)
+        } else {
+            None
+        };
         self.set_equation_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-            ci, cpi, props_json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            ci,
+            cpi,
+            props_json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 수식 스크립트를 SVG로 렌더링하여 반환한다 (미리보기 전용).
@@ -1926,16 +2256,17 @@ impl HwpDocument {
             let rest = &json[start + key.len()..];
             if let Some(end) = rest.find(']') {
                 let arr = &rest[..end];
-                return arr.split("},").filter_map(|item| {
-                    let item = item.trim().trim_start_matches('{').trim_end_matches('}');
-                    let x = crate::document_core::helpers::json_i32(
-                        &format!("{{{}}}", item), "x",
-                    )?;
-                    let y = crate::document_core::helpers::json_i32(
-                        &format!("{{{}}}", item), "y",
-                    )?;
-                    Some(crate::model::Point { x, y })
-                }).collect();
+                return arr
+                    .split("},")
+                    .filter_map(|item| {
+                        let item = item.trim().trim_start_matches('{').trim_end_matches('}');
+                        let x =
+                            crate::document_core::helpers::json_i32(&format!("{{{}}}", item), "x")?;
+                        let y =
+                            crate::document_core::helpers::json_i32(&format!("{{{}}}", item), "y")?;
+                        Some(crate::model::Point { x, y })
+                    })
+                    .collect();
             }
         }
         Vec::new()
@@ -1949,10 +2280,7 @@ impl HwpDocument {
     ///         "horzOffset":N,"vertOffset":N,"treatAsChar":bool,"textWrap":"Square"}`
     /// 반환: JSON `{"ok":true,"paraIdx":<N>,"controlIdx":0}`
     #[wasm_bindgen(js_name = createShapeControl)]
-    pub fn create_shape_control(
-        &mut self,
-        json: &str,
-    ) -> Result<String, JsValue> {
+    pub fn create_shape_control(&mut self, json: &str) -> Result<String, JsValue> {
         let sec = json_u32(json, "sectionIdx").unwrap_or(0) as usize;
         let para = json_u32(json, "paraIdx").unwrap_or(0) as usize;
         let offset = json_u32(json, "charOffset").unwrap_or(0) as usize;
@@ -1974,9 +2302,19 @@ impl HwpDocument {
             Vec::new()
         };
         let result = self.create_shape_control_native(
-            sec, para, offset, width, height,
-            horz_offset, vert_offset, treat_as_char, &text_wrap, &shape_type,
-            line_flip_x, line_flip_y, &polygon_points,
+            sec,
+            para,
+            offset,
+            width,
+            height,
+            horz_offset,
+            vert_offset,
+            treat_as_char,
+            &text_wrap,
+            &shape_type,
+            line_flip_x,
+            line_flip_y,
+            &polygon_points,
         )?;
 
         // 연결선: SubjectID + 제어점 라우팅 설정 (생성 후)
@@ -1988,7 +2326,15 @@ impl HwpDocument {
             let pi = json_u32(&result, "paraIdx");
             let ci = json_u32(&result, "controlIdx");
             if let (Some(pi), Some(ci)) = (pi, ci) {
-                self.update_connector_subject_ids(sec, pi as usize, ci as usize, ssid, ssidx, esid, esidx);
+                self.update_connector_subject_ids(
+                    sec,
+                    pi as usize,
+                    ci as usize,
+                    ssid,
+                    ssidx,
+                    esid,
+                    esidx,
+                );
                 self.recalculate_connector_routing(sec, pi as usize, ci as usize, ssidx, esidx);
             }
         }
@@ -2007,60 +2353,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.get_shape_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
-    }
-
-    /// Shape(글상자) 내부 텍스트를 반환한다.
-    ///
-    /// 반환: JSON `{"ok":true,"text":"..."}` 또는 `{"ok":false,"text":""}`
-    #[wasm_bindgen(js_name = getShapeText)]
-    pub fn get_shape_text(
-        &self,
-        section_idx: u32,
-        parent_para_idx: u32,
-        control_idx: u32,
-    ) -> String {
-        fn collect_paragraph_text(paras: &[crate::model::paragraph::Paragraph], out: &mut Vec<String>) {
-            for p in paras {
-                let t = p.text.trim();
-                if !t.is_empty() {
-                    out.push(t.to_string());
-                }
-            }
-        }
-
-        fn collect_shape_text(shape: &crate::model::shape::ShapeObject, out: &mut Vec<String>) {
-            if let Some(tb) = shape.drawing().and_then(|d| d.text_box.as_ref()) {
-                collect_paragraph_text(&tb.paragraphs, out);
-            }
-            if let crate::model::shape::ShapeObject::Group(g) = shape {
-                if let Some(cap) = g.caption.as_ref() {
-                    collect_paragraph_text(&cap.paragraphs, out);
-                }
-                for child in &g.children {
-                    collect_shape_text(child, out);
-                }
-            }
-        }
-
-        let sec = section_idx as usize;
-        let ppi = parent_para_idx as usize;
-        let ci = control_idx as usize;
-        let Some(section) = self.document.sections.get(sec) else {
-            return r#"{"ok":false,"text":""}"#.to_string();
-        };
-        let Some(para) = section.paragraphs.get(ppi) else {
-            return r#"{"ok":false,"text":""}"#.to_string();
-        };
-        let Some(Control::Shape(shape)) = para.controls.get(ci) else {
-            return r#"{"ok":false,"text":""}"#.to_string();
-        };
-
-        let mut lines: Vec<String> = Vec::new();
-        collect_shape_text(shape, &mut lines);
-        let text = lines.join("\n");
-        format!(r#"{{"ok":true,"text":"{}"}}"#, json_escape(&text))
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// Shape(글상자) 속성을 변경한다.
@@ -2075,9 +2372,12 @@ impl HwpDocument {
         props_json: &str,
     ) -> Result<String, JsValue> {
         self.set_shape_properties_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
             props_json,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// Shape(글상자) 컨트롤을 문단에서 삭제한다.
@@ -2091,8 +2391,11 @@ impl HwpDocument {
         control_idx: u32,
     ) -> Result<String, JsValue> {
         self.delete_shape_control_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// Shape z-order 변경
@@ -2106,8 +2409,12 @@ impl HwpDocument {
         operation: &str,
     ) -> Result<String, JsValue> {
         self.change_shape_z_order_native(
-            section_idx as usize, parent_para_idx as usize, control_idx as usize, operation,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            operation,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 선택된 개체들을 하나의 GroupShape로 묶는다.
@@ -2124,13 +2431,13 @@ impl HwpDocument {
                 let rest = &json[start..];
                 if let Some(arr_start) = rest.find('[') {
                     if let Some(arr_end) = rest.find(']') {
-                        let arr = &rest[arr_start+1..arr_end];
+                        let arr = &rest[arr_start + 1..arr_end];
                         // 각 {} 블록에서 paraIdx, controlIdx 추출
                         let mut pos = 0;
                         while let Some(obj_start) = arr[pos..].find('{') {
                             let obj_start = pos + obj_start;
                             if let Some(obj_end) = arr[obj_start..].find('}') {
-                                let obj = &arr[obj_start..obj_start+obj_end+1];
+                                let obj = &arr[obj_start..obj_start + obj_end + 1];
                                 let pi = json_u32(obj, "paraIdx").unwrap_or(0) as usize;
                                 let ci = json_u32(obj, "controlIdx").unwrap_or(0) as usize;
                                 result.push((pi, ci));
@@ -2144,19 +2451,38 @@ impl HwpDocument {
             }
             result
         };
-        self.group_shapes_native(sec, &targets).map_err(|e| e.into())
+        self.group_shapes_native(sec, &targets)
+            .map_err(|e| e.into())
     }
 
     /// GroupShape를 풀어 자식 개체들을 개별로 복원한다.
     #[wasm_bindgen(js_name = ungroupShape)]
-    pub fn ungroup_shape(&mut self, section_idx: u32, para_idx: u32, control_idx: u32) -> Result<String, JsValue> {
-        self.ungroup_shape_native(section_idx as usize, para_idx as usize, control_idx as usize)
-            .map_err(|e| e.into())
+    pub fn ungroup_shape(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.ungroup_shape_native(
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 직선 끝점 이동 (글로벌 HWPUNIT 좌표)
     #[wasm_bindgen(js_name = moveLineEndpoint)]
-    pub fn move_line_endpoint(&mut self, sec: u32, para: u32, ci: u32, sx: i32, sy: i32, ex: i32, ey: i32) -> Result<String, JsValue> {
+    pub fn move_line_endpoint(
+        &mut self,
+        sec: u32,
+        para: u32,
+        ci: u32,
+        sx: i32,
+        sy: i32,
+        ex: i32,
+        ey: i32,
+    ) -> Result<String, JsValue> {
         self.move_line_endpoint_native(sec as usize, para as usize, ci as usize, sx, sy, ex, ey)
             .map_err(|e| e.into())
     }
@@ -2169,92 +2495,159 @@ impl HwpDocument {
 
     /// 각주를 삽입한다.
     #[wasm_bindgen(js_name = insertFootnote)]
-    pub fn insert_footnote(&mut self, section_idx: u32, para_idx: u32, char_offset: u32) -> Result<String, JsValue> {
-        self.insert_footnote_native(section_idx as usize, para_idx as usize, char_offset as usize)
-            .map_err(|e| e.into())
+    pub fn insert_footnote(
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        char_offset: u32,
+    ) -> Result<String, JsValue> {
+        self.insert_footnote_native(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 정보를 조회한다.
     #[wasm_bindgen(js_name = getFootnoteInfo)]
-    pub fn get_footnote_info(&self, section_idx: u32, para_idx: u32, control_idx: u32) -> Result<String, JsValue> {
-        self.get_footnote_info_native(section_idx as usize, para_idx as usize, control_idx as usize)
-            .map_err(|e| e.into())
+    pub fn get_footnote_info(
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.get_footnote_info_native(
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 내 텍스트를 삽입한다.
     #[wasm_bindgen(js_name = insertTextInFootnote)]
     pub fn insert_text_in_footnote(
-        &mut self, section_idx: u32, para_idx: u32, control_idx: u32,
-        fn_para_idx: u32, char_offset: u32, text: &str,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
+        fn_para_idx: u32,
+        char_offset: u32,
+        text: &str,
     ) -> Result<String, JsValue> {
         self.insert_text_in_footnote_native(
-            section_idx as usize, para_idx as usize, control_idx as usize,
-            fn_para_idx as usize, char_offset as usize, text,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
+            fn_para_idx as usize,
+            char_offset as usize,
+            text,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 내 텍스트를 삭제한다.
     #[wasm_bindgen(js_name = deleteTextInFootnote)]
     pub fn delete_text_in_footnote(
-        &mut self, section_idx: u32, para_idx: u32, control_idx: u32,
-        fn_para_idx: u32, char_offset: u32, count: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
+        fn_para_idx: u32,
+        char_offset: u32,
+        count: u32,
     ) -> Result<String, JsValue> {
         self.delete_text_in_footnote_native(
-            section_idx as usize, para_idx as usize, control_idx as usize,
-            fn_para_idx as usize, char_offset as usize, count as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
+            fn_para_idx as usize,
+            char_offset as usize,
+            count as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 내 문단을 분할한다 (Enter).
     #[wasm_bindgen(js_name = splitParagraphInFootnote)]
     pub fn split_paragraph_in_footnote(
-        &mut self, section_idx: u32, para_idx: u32, control_idx: u32,
-        fn_para_idx: u32, char_offset: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
+        fn_para_idx: u32,
+        char_offset: u32,
     ) -> Result<String, JsValue> {
         self.split_paragraph_in_footnote_native(
-            section_idx as usize, para_idx as usize, control_idx as usize,
-            fn_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
+            fn_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 내 문단을 병합한다 (Backspace at start).
     #[wasm_bindgen(js_name = mergeParagraphInFootnote)]
     pub fn merge_paragraph_in_footnote(
-        &mut self, section_idx: u32, para_idx: u32, control_idx: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        control_idx: u32,
         fn_para_idx: u32,
     ) -> Result<String, JsValue> {
         self.merge_paragraph_in_footnote_native(
-            section_idx as usize, para_idx as usize, control_idx as usize,
+            section_idx as usize,
+            para_idx as usize,
+            control_idx as usize,
             fn_para_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 각주 영역 히트테스트
     #[wasm_bindgen(js_name = hitTestFootnote)]
     pub fn hit_test_footnote(&self, page_num: u32, x: f64, y: f64) -> Result<String, JsValue> {
-        self.hit_test_footnote_native(page_num, x, y).map_err(|e| e.into())
+        self.hit_test_footnote_native(page_num, x, y)
+            .map_err(|e| e.into())
     }
 
     /// 각주 내부 텍스트 히트테스트
     #[wasm_bindgen(js_name = hitTestInFootnote)]
     pub fn hit_test_in_footnote(&self, page_num: u32, x: f64, y: f64) -> Result<String, JsValue> {
-        self.hit_test_in_footnote_native(page_num, x, y).map_err(|e| e.into())
+        self.hit_test_in_footnote_native(page_num, x, y)
+            .map_err(|e| e.into())
     }
 
     /// 페이지의 각주 참조 정보
     #[wasm_bindgen(js_name = getPageFootnoteInfo)]
-    pub fn get_page_footnote_info(&self, page_num: u32, footnote_index: u32) -> Result<String, JsValue> {
-        self.get_page_footnote_info_native(page_num, footnote_index as usize).map_err(|e| e.into())
+    pub fn get_page_footnote_info(
+        &self,
+        page_num: u32,
+        footnote_index: u32,
+    ) -> Result<String, JsValue> {
+        self.get_page_footnote_info_native(page_num, footnote_index as usize)
+            .map_err(|e| e.into())
     }
 
     /// 각주 내 커서 렉트 계산
     #[wasm_bindgen(js_name = getCursorRectInFootnote)]
     pub fn get_cursor_rect_in_footnote(
-        &self, page_num: u32, footnote_index: u32, fn_para_idx: u32, char_offset: u32,
+        &self,
+        page_num: u32,
+        footnote_index: u32,
+        fn_para_idx: u32,
+        char_offset: u32,
     ) -> Result<String, JsValue> {
         self.get_cursor_rect_in_footnote_native(
-            page_num, footnote_index as usize, fn_para_idx as usize, char_offset as usize,
-        ).map_err(|e| e.into())
+            page_num,
+            footnote_index as usize,
+            fn_para_idx as usize,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 수직 커서 이동 (ArrowUp/Down) — 단일 호출로 줄/문단/표/구역 경계를 모두 처리한다.
@@ -2294,7 +2687,8 @@ impl HwpDocument {
             delta,
             preferred_x,
             cell_ctx,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── 필드 API (Task 230) ─────────────────────────────────
@@ -2312,8 +2706,7 @@ impl HwpDocument {
     /// 반환: `{ok, value}`
     #[wasm_bindgen(js_name = getFieldValue)]
     pub fn get_field_value(&self, field_id: u32) -> Result<String, JsValue> {
-        self.get_field_value_by_id(field_id)
-            .map_err(|e| e.into())
+        self.get_field_value_by_id(field_id).map_err(|e| e.into())
     }
 
     /// 필드 이름으로 값을 조회한다.
@@ -2321,8 +2714,7 @@ impl HwpDocument {
     /// 반환: `{ok, fieldId, value}`
     #[wasm_bindgen(js_name = getFieldValueByName)]
     pub fn get_field_value_by_name_api(&self, name: &str) -> Result<String, JsValue> {
-        self.get_field_value_by_name(name)
-            .map_err(|e| e.into())
+        self.get_field_value_by_name(name).map_err(|e| e.into())
     }
 
     /// field_id로 필드 값을 설정한다.
@@ -2338,7 +2730,11 @@ impl HwpDocument {
     ///
     /// 반환: `{ok, fieldId, oldValue, newValue}`
     #[wasm_bindgen(js_name = setFieldValueByName)]
-    pub fn set_field_value_by_name_api(&mut self, name: &str, value: &str) -> Result<String, JsValue> {
+    pub fn set_field_value_by_name_api(
+        &mut self,
+        name: &str,
+        value: &str,
+    ) -> Result<String, JsValue> {
         self.set_field_value_by_name(name, value)
             .map_err(|e| e.into())
     }
@@ -2351,13 +2747,9 @@ impl HwpDocument {
     ///
     /// 반환: `{found, sec, para, ci, formType, name, value, caption, text, bbox}`
     #[wasm_bindgen(js_name = getFormObjectAt)]
-    pub fn get_form_object_at(
-        &self,
-        page_num: u32,
-        x: f64,
-        y: f64,
-    ) -> Result<String, JsValue> {
-        self.core.get_form_object_at_native(page_num, x, y)
+    pub fn get_form_object_at(&self, page_num: u32, x: f64, y: f64) -> Result<String, JsValue> {
+        self.core
+            .get_form_object_at_native(page_num, x, y)
             .map_err(|e| e.into())
     }
 
@@ -2365,13 +2757,9 @@ impl HwpDocument {
     ///
     /// 반환: `{ok, formType, name, value, text, caption, enabled}`
     #[wasm_bindgen(js_name = getFormValue)]
-    pub fn get_form_value(
-        &self,
-        sec: u32,
-        para: u32,
-        ci: u32,
-    ) -> Result<String, JsValue> {
-        self.core.get_form_value_native(sec as usize, para as usize, ci as usize)
+    pub fn get_form_value(&self, sec: u32, para: u32, ci: u32) -> Result<String, JsValue> {
+        self.core
+            .get_form_value_native(sec as usize, para as usize, ci as usize)
             .map_err(|e| e.into())
     }
 
@@ -2387,7 +2775,8 @@ impl HwpDocument {
         ci: u32,
         value_json: &str,
     ) -> Result<String, JsValue> {
-        self.core.set_form_value_native(sec as usize, para as usize, ci as usize, value_json)
+        self.core
+            .set_form_value_native(sec as usize, para as usize, ci as usize, value_json)
             .map_err(|e| e.into())
     }
 
@@ -2411,24 +2800,26 @@ impl HwpDocument {
         form_ci: u32,
         value_json: &str,
     ) -> Result<String, JsValue> {
-        self.core.set_form_value_in_cell_native(
-            sec as usize, table_para as usize, table_ci as usize,
-            cell_idx as usize, cell_para as usize, form_ci as usize,
-            value_json,
-        ).map_err(|e| e.into())
+        self.core
+            .set_form_value_in_cell_native(
+                sec as usize,
+                table_para as usize,
+                table_ci as usize,
+                cell_idx as usize,
+                cell_para as usize,
+                form_ci as usize,
+                value_json,
+            )
+            .map_err(|e| e.into())
     }
 
     /// 양식 개체 상세 정보를 반환한다 (properties 포함).
     ///
     /// 반환: `{ok, formType, name, value, text, caption, enabled, width, height, foreColor, backColor, properties}`
     #[wasm_bindgen(js_name = getFormObjectInfo)]
-    pub fn get_form_object_info(
-        &self,
-        sec: u32,
-        para: u32,
-        ci: u32,
-    ) -> Result<String, JsValue> {
-        self.core.get_form_object_info_native(sec as usize, para as usize, ci as usize)
+    pub fn get_form_object_info(&self, sec: u32, para: u32, ci: u32) -> Result<String, JsValue> {
+        self.core
+            .get_form_object_info_native(sec as usize, para as usize, ci as usize)
             .map_err(|e| e.into())
     }
 
@@ -2445,14 +2836,16 @@ impl HwpDocument {
         forward: bool,
         case_sensitive: bool,
     ) -> Result<String, JsValue> {
-        self.core.search_text_native(
-            query,
-            from_sec as usize,
-            from_para as usize,
-            from_char as usize,
-            forward,
-            case_sensitive,
-        ).map_err(|e| e.into())
+        self.core
+            .search_text_native(
+                query,
+                from_sec as usize,
+                from_para as usize,
+                from_char as usize,
+                forward,
+                case_sensitive,
+            )
+            .map_err(|e| e.into())
     }
 
     /// 텍스트 치환 (단일)
@@ -2465,13 +2858,15 @@ impl HwpDocument {
         length: u32,
         new_text: &str,
     ) -> Result<String, JsValue> {
-        self.core.replace_text_native(
-            sec as usize,
-            para as usize,
-            char_offset as usize,
-            length as usize,
-            new_text,
-        ).map_err(|e| e.into())
+        self.core
+            .replace_text_native(
+                sec as usize,
+                para as usize,
+                char_offset as usize,
+                length as usize,
+                new_text,
+            )
+            .map_err(|e| e.into())
     }
 
     /// 단일 치환 (검색어 기반) — 첫 번째 매치만 교체
@@ -2494,31 +2889,25 @@ impl HwpDocument {
         new_text: &str,
         case_sensitive: bool,
     ) -> Result<String, JsValue> {
-        self.core.replace_all_native(query, new_text, case_sensitive)
+        self.core
+            .replace_all_native(query, new_text, case_sensitive)
             .map_err(|e| e.into())
     }
 
     /// 글로벌 쪽 번호에 해당하는 첫 문단 위치 반환
     #[wasm_bindgen(js_name = getPositionOfPage)]
-    pub fn get_position_of_page(
-        &self,
-        global_page: u32,
-    ) -> Result<String, JsValue> {
-        self.core.get_position_of_page_native(global_page as usize)
+    pub fn get_position_of_page(&self, global_page: u32) -> Result<String, JsValue> {
+        self.core
+            .get_position_of_page_native(global_page as usize)
             .map_err(|e| e.into())
     }
 
     /// 위치에 해당하는 글로벌 쪽 번호 반환
     #[wasm_bindgen(js_name = getPageOfPosition)]
-    pub fn get_page_of_position(
-        &self,
-        section_idx: u32,
-        para_idx: u32,
-    ) -> Result<String, JsValue> {
-        self.core.get_page_of_position_native(
-            section_idx as usize,
-            para_idx as usize,
-        ).map_err(|e| e.into())
+    pub fn get_page_of_position(&self, section_idx: u32, para_idx: u32) -> Result<String, JsValue> {
+        self.core
+            .get_page_of_position_native(section_idx as usize, para_idx as usize)
+            .map_err(|e| e.into())
     }
 
     /// 커서 위치의 필드 범위 정보를 조회한다 (본문 문단).
@@ -2531,7 +2920,11 @@ impl HwpDocument {
         para_idx: u32,
         char_offset: u32,
     ) -> String {
-        self.get_field_info_at(section_idx as usize, para_idx as usize, char_offset as usize)
+        self.get_field_info_at(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
     }
 
     /// 커서 위치의 필드 범위 정보를 조회한다 (셀/글상자 내 문단).
@@ -2547,9 +2940,12 @@ impl HwpDocument {
         is_textbox: bool,
     ) -> String {
         self.get_field_info_at_in_cell(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
             is_textbox,
         )
     }
@@ -2562,12 +2958,16 @@ impl HwpDocument {
         para_idx: u32,
         char_offset: u32,
     ) -> String {
-        match self.remove_field_at(section_idx as usize, para_idx as usize, char_offset as usize) {
+        match self.remove_field_at(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let escaped = e.to_string().replace('\\', "\\\\").replace('"', "\\\"");
                 format!("{{\"ok\":false,\"error\":\"{}\"}}", escaped)
-            },
+            }
         }
     }
 
@@ -2584,16 +2984,19 @@ impl HwpDocument {
         is_textbox: bool,
     ) -> String {
         match self.remove_field_at_in_cell(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
             is_textbox,
         ) {
             Ok(s) => s,
             Err(e) => {
                 let escaped = e.to_string().replace('\\', "\\\\").replace('"', "\\\"");
                 format!("{{\"ok\":false,\"error\":\"{}\"}}", escaped)
-            },
+            }
         }
     }
 
@@ -2605,7 +3008,11 @@ impl HwpDocument {
         para_idx: u32,
         char_offset: u32,
     ) -> bool {
-        self.set_active_field(section_idx as usize, para_idx as usize, char_offset as usize)
+        self.set_active_field(
+            section_idx as usize,
+            para_idx as usize,
+            char_offset as usize,
+        )
     }
 
     /// 활성 필드를 설정한다 (셀/글상자 내 문단 — 안내문 숨김용).
@@ -2622,9 +3029,12 @@ impl HwpDocument {
         is_textbox: bool,
     ) -> bool {
         self.set_active_field_in_cell(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, char_offset as usize,
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            char_offset as usize,
             is_textbox,
         )
     }
@@ -2632,11 +3042,18 @@ impl HwpDocument {
     /// path 기반: 중첩 표 셀의 필드 범위 정보를 조회한다.
     #[wasm_bindgen(js_name = getFieldInfoAtByPath)]
     pub fn get_field_info_at_by_path_api(
-        &self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32,
+        &self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
     ) -> String {
         match DocumentCore::parse_cell_path(path_json) {
             Ok(path) => self.get_field_info_at_by_path(
-                section_idx as usize, parent_para_idx as usize, &path, char_offset as usize,
+                section_idx as usize,
+                parent_para_idx as usize,
+                &path,
+                char_offset as usize,
             ),
             Err(_) => r#"{"inField":false}"#.to_string(),
         }
@@ -2645,11 +3062,18 @@ impl HwpDocument {
     /// path 기반: 중첩 표 셀 내 활성 필드를 설정한다.
     #[wasm_bindgen(js_name = setActiveFieldByPath)]
     pub fn set_active_field_by_path_api(
-        &mut self, section_idx: u32, parent_para_idx: u32, path_json: &str, char_offset: u32,
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        path_json: &str,
+        char_offset: u32,
     ) -> bool {
         match DocumentCore::parse_cell_path(path_json) {
             Ok(path) => self.set_active_field_by_path(
-                section_idx as usize, parent_para_idx as usize, &path, char_offset as usize,
+                section_idx as usize,
+                parent_para_idx as usize,
+                &path,
+                char_offset as usize,
             ),
             Err(_) => false,
         }
@@ -2683,7 +3107,8 @@ impl HwpDocument {
                 for ctrl in &para.controls {
                     let paras: Vec<&crate::model::paragraph::Paragraph> = match ctrl {
                         Control::Table(t) => t.cells.iter().flat_map(|c| &c.paragraphs).collect(),
-                        Control::Shape(s) => s.drawing()
+                        Control::Shape(s) => s
+                            .drawing()
                             .and_then(|d| d.text_box.as_ref())
                             .map(|tb| tb.paragraphs.iter().collect())
                             .unwrap_or_default(),
@@ -2709,14 +3134,19 @@ impl HwpDocument {
         let guide = f.guide_text().unwrap_or("");
         let memo = f.memo_text().unwrap_or("");
         // 필드 이름: ctrl_data_name → command Name: 키 순서
-        let name = f.ctrl_data_name.as_deref()
+        let name = f
+            .ctrl_data_name
+            .as_deref()
             .filter(|s| !s.is_empty())
             .or_else(|| f.extract_wstring_value("Name:"))
             .unwrap_or("");
         let editable = f.is_editable_in_form();
         format!(
             "{{\"ok\":true,\"guide\":\"{}\",\"memo\":\"{}\",\"name\":\"{}\",\"editable\":{}}}",
-            json_escape(guide), json_escape(memo), json_escape(name), editable,
+            json_escape(guide),
+            json_escape(memo),
+            json_escape(name),
+            editable,
         )
     }
 
@@ -2739,7 +3169,11 @@ impl HwpDocument {
         // 필드를 찾아 수정하고, ctrl_data_records 바이너리도 갱신
         fn update_field_in_para(
             para: &mut crate::model::paragraph::Paragraph,
-            field_id: u32, guide: &str, memo: &str, new_props_bit: u32, new_name: &str,
+            field_id: u32,
+            guide: &str,
+            memo: &str,
+            new_props_bit: u32,
+            new_name: &str,
         ) -> bool {
             for (ci, ctrl) in para.controls.iter_mut().enumerate() {
                 if let Control::Field(f) = ctrl {
@@ -2757,7 +3191,11 @@ impl HwpDocument {
                         // command가 변경되지 않았으면 원본 보존
 
                         f.properties = (f.properties & !1) | new_props_bit;
-                        f.ctrl_data_name = if new_name.is_empty() { None } else { Some(new_name.to_string()) };
+                        f.ctrl_data_name = if new_name.is_empty() {
+                            None
+                        } else {
+                            Some(new_name.to_string())
+                        };
                         // ctrl_data_records 바이너리 갱신
                         update_ctrl_data_name(&mut para.ctrl_data_records, ci, new_name);
                         return true;
@@ -2768,11 +3206,7 @@ impl HwpDocument {
         }
 
         /// ctrl_data_records[ci]의 필드 이름 부분을 새 이름으로 재구축
-        fn update_ctrl_data_name(
-            records: &mut Vec<Option<Vec<u8>>>,
-            ci: usize,
-            new_name: &str,
-        ) {
+        fn update_ctrl_data_name(records: &mut Vec<Option<Vec<u8>>>, ci: usize, new_name: &str) {
             // records 확장 (인덱스 부족 시)
             while records.len() <= ci {
                 records.push(None);
@@ -2814,19 +3248,26 @@ impl HwpDocument {
                 // 표/글상자 내부
                 for ctrl in &mut para.controls {
                     let found = match ctrl {
-                        Control::Table(t) => {
-                            t.cells.iter_mut().any(|c| {
-                                c.paragraphs.iter_mut().any(|p| {
-                                    update_field_in_para(p, field_id, guide, memo, new_props_bit, name)
-                                })
+                        Control::Table(t) => t.cells.iter_mut().any(|c| {
+                            c.paragraphs.iter_mut().any(|p| {
+                                update_field_in_para(p, field_id, guide, memo, new_props_bit, name)
                             })
-                        }
+                        }),
                         Control::Shape(s) => {
                             if let Some(tb) = s.drawing_mut().and_then(|d| d.text_box.as_mut()) {
                                 tb.paragraphs.iter_mut().any(|p| {
-                                    update_field_in_para(p, field_id, guide, memo, new_props_bit, name)
+                                    update_field_in_para(
+                                        p,
+                                        field_id,
+                                        guide,
+                                        memo,
+                                        new_props_bit,
+                                        name,
+                                    )
                                 })
-                            } else { false }
+                            } else {
+                                false
+                            }
                         }
                         _ => false,
                     };
@@ -2855,9 +3296,12 @@ impl HwpDocument {
         char_offset: u32,
     ) -> Result<String, JsValue> {
         self.get_cursor_rect_by_path_native(
-            section_idx as usize, parent_para_idx as usize,
-            path_json, char_offset as usize,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            path_json,
+            char_offset as usize,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 경로 기반 셀 정보 조회 (중첩 표용).
@@ -2870,9 +3314,8 @@ impl HwpDocument {
         parent_para_idx: u32,
         path_json: &str,
     ) -> Result<String, JsValue> {
-        self.get_cell_info_by_path_native(
-            section_idx as usize, parent_para_idx as usize, path_json,
-        ).map_err(|e| e.into())
+        self.get_cell_info_by_path_native(section_idx as usize, parent_para_idx as usize, path_json)
+            .map_err(|e| e.into())
     }
 
     /// 경로 기반 표 차원 조회 (중첩 표용).
@@ -2886,8 +3329,11 @@ impl HwpDocument {
         path_json: &str,
     ) -> Result<String, JsValue> {
         self.get_table_dimensions_by_path_native(
-            section_idx as usize, parent_para_idx as usize, path_json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            path_json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 경로 기반 표 셀 바운딩박스 조회 (중첩 표용).
@@ -2901,8 +3347,11 @@ impl HwpDocument {
         path_json: &str,
     ) -> Result<String, JsValue> {
         self.get_table_cell_bboxes_by_path_native(
-            section_idx as usize, parent_para_idx as usize, path_json,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            path_json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 경로 기반 수직 커서 이동 (중첩 표용).
@@ -2919,9 +3368,14 @@ impl HwpDocument {
         preferred_x: f64,
     ) -> Result<String, JsValue> {
         self.move_vertical_by_path_native(
-            section_idx as usize, parent_para_idx as usize,
-            path_json, char_offset as usize, delta, preferred_x,
-        ).map_err(|e| e.into())
+            section_idx as usize,
+            parent_para_idx as usize,
+            path_json,
+            char_offset as usize,
+            delta,
+            preferred_x,
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── Phase 4: Selection API ──────────────────────────────
@@ -2940,10 +3394,13 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.get_selection_rects_native(
             section_idx as usize,
-            start_para_idx as usize, start_char_offset as usize,
-            end_para_idx as usize, end_char_offset as usize,
+            start_para_idx as usize,
+            start_char_offset as usize,
+            end_para_idx as usize,
+            end_char_offset as usize,
             None,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 내 선택 영역의 줄별 사각형을 반환한다.
@@ -2963,10 +3420,17 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.get_selection_rects_native(
             section_idx as usize,
-            start_cell_para_idx as usize, start_char_offset as usize,
-            end_cell_para_idx as usize, end_char_offset as usize,
-            Some((parent_para_idx as usize, control_idx as usize, cell_idx as usize)),
-        ).map_err(|e| e.into())
+            start_cell_para_idx as usize,
+            start_char_offset as usize,
+            end_cell_para_idx as usize,
+            end_char_offset as usize,
+            Some((
+                parent_para_idx as usize,
+                control_idx as usize,
+                cell_idx as usize,
+            )),
+        )
+        .map_err(|e| e.into())
     }
 
     /// 본문 선택 영역을 삭제한다.
@@ -2983,10 +3447,13 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.delete_range_native(
             section_idx as usize,
-            start_para_idx as usize, start_char_offset as usize,
-            end_para_idx as usize, end_char_offset as usize,
+            start_para_idx as usize,
+            start_char_offset as usize,
+            end_para_idx as usize,
+            end_char_offset as usize,
             None,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 셀 내 선택 영역을 삭제한다.
@@ -3006,10 +3473,17 @@ impl HwpDocument {
     ) -> Result<String, JsValue> {
         self.delete_range_native(
             section_idx as usize,
-            start_cell_para_idx as usize, start_char_offset as usize,
-            end_cell_para_idx as usize, end_char_offset as usize,
-            Some((parent_para_idx as usize, control_idx as usize, cell_idx as usize)),
-        ).map_err(|e| e.into())
+            start_cell_para_idx as usize,
+            start_char_offset as usize,
+            end_cell_para_idx as usize,
+            end_char_offset as usize,
+            Some((
+                parent_para_idx as usize,
+                control_idx as usize,
+                cell_idx as usize,
+            )),
+        )
+        .map_err(|e| e.into())
     }
 
     // ─── Phase 4 끝 ─────────────────────────────────────────
@@ -3225,8 +3699,15 @@ impl HwpDocument {
         cell_para_idx: usize,
         char_offset: usize,
     ) -> Result<String, JsValue> {
-        self.get_cell_char_properties_at_native(sec_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx, char_offset)
-            .map_err(|e| e.into())
+        self.get_cell_char_properties_at_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            char_offset,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 캐럿 위치의 문단 속성을 조회한다.
@@ -3252,8 +3733,14 @@ impl HwpDocument {
         cell_idx: usize,
         cell_para_idx: usize,
     ) -> Result<String, JsValue> {
-        self.get_cell_para_properties_at_native(sec_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx)
-            .map_err(|e| e.into())
+        self.get_cell_para_properties_at_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 문서에 정의된 스타일 목록을 조회한다.
@@ -3288,13 +3775,19 @@ impl HwpDocument {
             Some(s) => s,
             None => return "{}".to_string(),
         };
-        let char_json = self.core.build_char_properties_json_by_id(style.char_shape_id);
+        let char_json = self
+            .core
+            .build_char_properties_json_by_id(style.char_shape_id);
 
         // 스타일의 기본 ParaShape에 번호 정보가 없으면,
         // 이 스타일을 사용하는 실제 문단의 ParaShape에서 조회
-        let effective_psid = self.find_effective_para_shape_for_style(style_id, style.para_shape_id);
+        let effective_psid =
+            self.find_effective_para_shape_for_style(style_id, style.para_shape_id);
         let para_json = self.core.build_para_properties_json(effective_psid, 0);
-        format!("{{\"charProps\":{},\"paraProps\":{}}}", char_json, para_json)
+        format!(
+            "{{\"charProps\":{},\"paraProps\":{}}}",
+            char_json, para_json
+        )
     }
 
     /// 스타일의 실효 ParaShape ID를 찾는다.
@@ -3302,7 +3795,13 @@ impl HwpDocument {
     fn find_effective_para_shape_for_style(&self, style_id: u32, base_psid: u16) -> u16 {
         use crate::model::style::HeadType;
         // 기본 ParaShape에 이미 번호 정보가 있으면 그대로 사용
-        if let Some(ps) = self.core.document.doc_info.para_shapes.get(base_psid as usize) {
+        if let Some(ps) = self
+            .core
+            .document
+            .doc_info
+            .para_shapes
+            .get(base_psid as usize)
+        {
             if ps.head_type != HeadType::None {
                 return base_psid;
             }
@@ -3312,7 +3811,13 @@ impl HwpDocument {
         for section in &self.core.document.sections {
             for para in &section.paragraphs {
                 if para.style_id == sid {
-                    if let Some(ps) = self.core.document.doc_info.para_shapes.get(para.para_shape_id as usize) {
+                    if let Some(ps) = self
+                        .core
+                        .document
+                        .doc_info
+                        .para_shapes
+                        .get(para.para_shape_id as usize)
+                    {
                         if ps.head_type != HeadType::None {
                             return para.para_shape_id;
                         }
@@ -3353,7 +3858,12 @@ impl HwpDocument {
     ///
     /// charMods/paraMods는 기존 parse_char_shape_mods/parse_para_shape_mods와 동일한 JSON 형식
     #[wasm_bindgen(js_name = updateStyleShapes)]
-    pub fn update_style_shapes(&mut self, style_id: u32, char_mods_json: &str, para_mods_json: &str) -> bool {
+    pub fn update_style_shapes(
+        &mut self,
+        style_id: u32,
+        char_mods_json: &str,
+        para_mods_json: &str,
+    ) -> bool {
         let styles = &self.core.document.doc_info.styles;
         let style = match styles.get(style_id as usize) {
             Some(s) => s.clone(),
@@ -3363,7 +3873,13 @@ impl HwpDocument {
         // CharShape 수정
         if !char_mods_json.is_empty() && char_mods_json != "{}" {
             let char_mods = crate::document_core::helpers::parse_char_shape_mods(char_mods_json);
-            if let Some(cs) = self.core.document.doc_info.char_shapes.get(style.char_shape_id as usize) {
+            if let Some(cs) = self
+                .core
+                .document
+                .doc_info
+                .char_shapes
+                .get(style.char_shape_id as usize)
+            {
                 let new_cs = char_mods.apply_to(cs);
                 // 새 CharShape를 추가하고 스타일에 연결
                 self.core.document.doc_info.char_shapes.push(new_cs);
@@ -3375,7 +3891,13 @@ impl HwpDocument {
         // ParaShape 수정
         if !para_mods_json.is_empty() && para_mods_json != "{}" {
             let para_mods = crate::document_core::helpers::parse_para_shape_mods(para_mods_json);
-            if let Some(ps) = self.core.document.doc_info.para_shapes.get(style.para_shape_id as usize) {
+            if let Some(ps) = self
+                .core
+                .document
+                .doc_info
+                .para_shapes
+                .get(style.para_shape_id as usize)
+            {
                 let new_ps = para_mods.apply_to(ps);
                 self.core.document.doc_info.para_shapes.push(new_ps);
                 let new_id = (self.core.document.doc_info.para_shapes.len() - 1) as u16;
@@ -3396,10 +3918,11 @@ impl HwpDocument {
                 if para.style_id == sid {
                     para.para_shape_id = new_psid;
                     para.char_shapes.clear();
-                    para.char_shapes.push(crate::model::paragraph::CharShapeRef {
-                        start_pos: 0,
-                        char_shape_id: new_csid,
-                    });
+                    para.char_shapes
+                        .push(crate::model::paragraph::CharShapeRef {
+                            start_pos: 0,
+                            char_shape_id: new_csid,
+                        });
                 }
                 // 셀 내 문단도 전파
                 for ctrl in &mut para.controls {
@@ -3409,10 +3932,12 @@ impl HwpDocument {
                                 if cpara.style_id == sid {
                                     cpara.para_shape_id = new_psid;
                                     cpara.char_shapes.clear();
-                                    cpara.char_shapes.push(crate::model::paragraph::CharShapeRef {
-                                        start_pos: 0,
-                                        char_shape_id: new_csid,
-                                    });
+                                    cpara
+                                        .char_shapes
+                                        .push(crate::model::paragraph::CharShapeRef {
+                                            start_pos: 0,
+                                            char_shape_id: new_csid,
+                                        });
                                 }
                             }
                         }
@@ -3463,7 +3988,10 @@ impl HwpDocument {
         self.core.document.doc_info.styles.push(new_style);
         let new_id = (self.core.document.doc_info.styles.len() - 1) as i32;
         // 스타일 캐시 갱신
-        self.core.styles = crate::renderer::style_resolver::resolve_styles(&self.core.document.doc_info, self.core.dpi);
+        self.core.styles = crate::renderer::style_resolver::resolve_styles(
+            &self.core.document.doc_info,
+            self.core.dpi,
+        );
         new_id
     }
 
@@ -3508,7 +4036,10 @@ impl HwpDocument {
             }
         }
         // 스타일 캐시 갱신
-        self.core.styles = crate::renderer::style_resolver::resolve_styles(&self.core.document.doc_info, self.core.dpi);
+        self.core.styles = crate::renderer::style_resolver::resolve_styles(
+            &self.core.document.doc_info,
+            self.core.dpi,
+        );
         true
     }
 
@@ -3521,7 +4052,9 @@ impl HwpDocument {
         let numberings = &self.core.document.doc_info.numberings;
         let mut items = Vec::new();
         for (i, n) in numberings.iter().enumerate() {
-            let formats: Vec<String> = n.level_formats.iter()
+            let formats: Vec<String> = n
+                .level_formats
+                .iter()
                 .map(|f| format!("\"{}\"", f.replace('"', "\\\"")))
                 .collect();
             items.push(format!(
@@ -3568,24 +4101,45 @@ impl HwpDocument {
         use crate::model::style::{Numbering, NumberingHead};
         let mut n = Numbering::default();
         n.level_formats = [
-            "^1.".to_string(),    // 1.
-            "^2)".to_string(),    // 가)
-            "^3)".to_string(),    // (1)
-            "^4)".to_string(),    // (가)
-            "^5)".to_string(),    // ①
-            "^6)".to_string(),    // ㄱ)
-            "^7)".to_string(),    // a)
+            "^1.".to_string(), // 1.
+            "^2)".to_string(), // 가)
+            "^3)".to_string(), // (1)
+            "^4)".to_string(), // (가)
+            "^5)".to_string(), // ①
+            "^6)".to_string(), // ㄱ)
+            "^7)".to_string(), // a)
         ];
         n.start_number = 1;
         n.level_start_numbers = [1; 7];
         // 수준별 번호 형식 코드 설정
-        n.heads[0] = NumberingHead { number_format: 0, ..Default::default() }; // 1,2,3
-        n.heads[1] = NumberingHead { number_format: 8, ..Default::default() }; // 가,나,다
-        n.heads[2] = NumberingHead { number_format: 0, ..Default::default() }; // 1,2,3
-        n.heads[3] = NumberingHead { number_format: 8, ..Default::default() }; // 가,나,다
-        n.heads[4] = NumberingHead { number_format: 1, ..Default::default() }; // ①②③
-        n.heads[5] = NumberingHead { number_format: 10, ..Default::default() }; // ㄱ,ㄴ,ㄷ
-        n.heads[6] = NumberingHead { number_format: 5, ..Default::default() }; // a,b,c
+        n.heads[0] = NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; // 1,2,3
+        n.heads[1] = NumberingHead {
+            number_format: 8,
+            ..Default::default()
+        }; // 가,나,다
+        n.heads[2] = NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; // 1,2,3
+        n.heads[3] = NumberingHead {
+            number_format: 8,
+            ..Default::default()
+        }; // 가,나,다
+        n.heads[4] = NumberingHead {
+            number_format: 1,
+            ..Default::default()
+        }; // ①②③
+        n.heads[5] = NumberingHead {
+            number_format: 10,
+            ..Default::default()
+        }; // ㄱ,ㄴ,ㄷ
+        n.heads[6] = NumberingHead {
+            number_format: 5,
+            ..Default::default()
+        }; // a,b,c
         self.core.document.doc_info.numberings.push(n);
         1
     }
@@ -3596,8 +4150,8 @@ impl HwpDocument {
     /// 반환값: Numbering ID (1-based)
     #[wasm_bindgen(js_name = createNumbering)]
     pub fn create_numbering(&mut self, json: &str) -> u16 {
+        use crate::document_core::helpers::json_i32;
         use crate::model::style::{Numbering, NumberingHead};
-        use crate::document_core::helpers::{json_i32};
 
         let mut n = Numbering::default();
 
@@ -3609,7 +4163,9 @@ impl HwpDocument {
                     let arr_str = &rest[bracket_start + 1..bracket_start + bracket_end];
                     let mut level = 0;
                     for part in arr_str.split(',') {
-                        if level >= 7 { break; }
+                        if level >= 7 {
+                            break;
+                        }
                         let trimmed = part.trim().trim_matches('"');
                         if !trimmed.is_empty() {
                             n.level_formats[level] = trimmed.to_string();
@@ -3628,9 +4184,14 @@ impl HwpDocument {
                     let arr_str = &rest[bracket_start + 1..bracket_start + bracket_end];
                     let mut level = 0;
                     for part in arr_str.split(',') {
-                        if level >= 7 { break; }
+                        if level >= 7 {
+                            break;
+                        }
                         if let Ok(code) = part.trim().parse::<u8>() {
-                            n.heads[level] = NumberingHead { number_format: code, ..Default::default() };
+                            n.heads[level] = NumberingHead {
+                                number_format: code,
+                                ..Default::default()
+                            };
                             level += 1;
                         }
                     }
@@ -3676,14 +4237,27 @@ impl HwpDocument {
     pub fn get_style_at(&self, sec_idx: u32, para_idx: u32) -> String {
         let sec = sec_idx as usize;
         let para = para_idx as usize;
-        let style_id = self.core.document.sections.get(sec)
+        let style_id = self
+            .core
+            .document
+            .sections
+            .get(sec)
             .and_then(|s| s.paragraphs.get(para))
             .map(|p| p.style_id as usize)
             .unwrap_or(0);
-        let name = self.core.document.doc_info.styles.get(style_id)
+        let name = self
+            .core
+            .document
+            .doc_info
+            .styles
+            .get(style_id)
             .map(|s| s.local_name.as_str())
             .unwrap_or("");
-        format!("{{\"id\":{},\"name\":\"{}\"}}", style_id, name.replace('"', "\\\""))
+        format!(
+            "{{\"id\":{},\"name\":\"{}\"}}",
+            style_id,
+            name.replace('"', "\\\"")
+        )
     }
 
     /// 셀 내부 문단의 스타일을 조회한다.
@@ -3696,16 +4270,30 @@ impl HwpDocument {
         cell_idx: u32,
         cell_para_idx: u32,
     ) -> String {
-        let style_id = self.core.get_cell_paragraph_ref(
-            sec_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize, cell_para_idx as usize,
-        )
+        let style_id = self
+            .core
+            .get_cell_paragraph_ref(
+                sec_idx as usize,
+                parent_para_idx as usize,
+                control_idx as usize,
+                cell_idx as usize,
+                cell_para_idx as usize,
+            )
             .map(|p| p.style_id as usize)
             .unwrap_or(0);
-        let name = self.core.document.doc_info.styles.get(style_id)
+        let name = self
+            .core
+            .document
+            .doc_info
+            .styles
+            .get(style_id)
             .map(|s| s.local_name.as_str())
             .unwrap_or("");
-        format!("{{\"id\":{},\"name\":\"{}\"}}", style_id, name.replace('"', "\\\""))
+        format!(
+            "{{\"id\":{},\"name\":\"{}\"}}",
+            style_id,
+            name.replace('"', "\\\"")
+        )
     }
 
     /// 스타일을 적용한다 (본문 문단).
@@ -3716,7 +4304,8 @@ impl HwpDocument {
         para_idx: u32,
         style_id: u32,
     ) -> Result<String, JsValue> {
-        self.core.apply_style_native(sec_idx as usize, para_idx as usize, style_id as usize)
+        self.core
+            .apply_style_native(sec_idx as usize, para_idx as usize, style_id as usize)
             .map_err(|e| e.into())
     }
 
@@ -3731,11 +4320,16 @@ impl HwpDocument {
         cell_para_idx: u32,
         style_id: u32,
     ) -> Result<String, JsValue> {
-        self.core.apply_cell_style_native(
-            sec_idx as usize, parent_para_idx as usize,
-            control_idx as usize, cell_idx as usize,
-            cell_para_idx as usize, style_id as usize,
-        ).map_err(|e| e.into())
+        self.core
+            .apply_cell_style_native(
+                sec_idx as usize,
+                parent_para_idx as usize,
+                control_idx as usize,
+                cell_idx as usize,
+                cell_para_idx as usize,
+                style_id as usize,
+            )
+            .map_err(|e| e.into())
     }
 
     /// 표 셀에서 계산식을 실행한다.
@@ -3753,11 +4347,17 @@ impl HwpDocument {
         formula: &str,
         write_result: bool,
     ) -> Result<String, JsValue> {
-        self.core.evaluate_table_formula(
-            section_idx as usize, parent_para_idx as usize,
-            control_idx as usize, target_row as usize,
-            target_col as usize, formula, write_result,
-        ).map_err(|e| e.into())
+        self.core
+            .evaluate_table_formula(
+                section_idx as usize,
+                parent_para_idx as usize,
+                control_idx as usize,
+                target_row as usize,
+                target_col as usize,
+                formula,
+                write_result,
+            )
+            .map_err(|e| e.into())
     }
 
     /// 글꼴 이름으로 font_id를 조회하거나 새로 생성한다.
@@ -3772,7 +4372,8 @@ impl HwpDocument {
     /// 특정 언어 카테고리에서 글꼴 이름으로 ID를 찾거나 등록한다.
     #[wasm_bindgen(js_name = findOrCreateFontIdForLang)]
     pub fn wasm_find_or_create_font_id_for_lang(&mut self, lang: u32, name: &str) -> i32 {
-        self.core.find_or_create_font_id_for_lang(lang as usize, name)
+        self.core
+            .find_or_create_font_id_for_lang(lang as usize, name)
     }
 
     /// 글자 서식을 적용한다 (본문 문단).
@@ -3802,22 +4403,43 @@ impl HwpDocument {
         end_offset: usize,
         props_json: &str,
     ) -> Result<String, JsValue> {
-        self.apply_char_format_in_cell_native(sec_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx, start_offset, end_offset, props_json)
-            .map_err(|e| e.into())
+        self.apply_char_format_in_cell_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            start_offset,
+            end_offset,
+            props_json,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 감추기 설정
     #[wasm_bindgen(js_name = setPageHide)]
     pub fn set_page_hide(
-        &mut self, sec: u32, para: u32,
-        hide_header: bool, hide_footer: bool, hide_master: bool,
-        hide_border: bool, hide_fill: bool, hide_page_num: bool,
+        &mut self,
+        sec: u32,
+        para: u32,
+        hide_header: bool,
+        hide_footer: bool,
+        hide_master: bool,
+        hide_border: bool,
+        hide_fill: bool,
+        hide_page_num: bool,
     ) -> Result<String, JsValue> {
         self.set_page_hide_native(
-            sec as usize, para as usize,
-            hide_header, hide_footer, hide_master,
-            hide_border, hide_fill, hide_page_num,
-        ).map_err(|e| e.into())
+            sec as usize,
+            para as usize,
+            hide_header,
+            hide_footer,
+            hide_master,
+            hide_border,
+            hide_fill,
+            hide_page_num,
+        )
+        .map_err(|e| e.into())
     }
 
     /// 감추기 조회
@@ -3831,7 +4453,11 @@ impl HwpDocument {
     /// 문단 번호 시작 방식 설정
     #[wasm_bindgen(js_name = setNumberingRestart)]
     pub fn set_numbering_restart(
-        &mut self, section_idx: u32, para_idx: u32, mode: u8, start_num: u32,
+        &mut self,
+        section_idx: u32,
+        para_idx: u32,
+        mode: u8,
+        start_num: u32,
     ) -> Result<String, JsValue> {
         self.set_numbering_restart_native(section_idx as usize, para_idx as usize, mode, start_num)
             .map_err(|e| e.into())
@@ -3859,8 +4485,15 @@ impl HwpDocument {
         cell_para_idx: usize,
         props_json: &str,
     ) -> Result<String, JsValue> {
-        self.apply_para_format_in_cell_native(sec_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx, props_json)
-            .map_err(|e| e.into())
+        self.apply_para_format_in_cell_native(
+            sec_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            props_json,
+        )
+        .map_err(|e| e.into())
     }
 
     // =====================================================================
@@ -3903,7 +4536,8 @@ impl HwpDocument {
             start_char_offset as usize,
             end_para_idx as usize,
             end_char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 표 셀 내부 선택 영역을 내부 클립보드에 복사한다.
@@ -3928,7 +4562,8 @@ impl HwpDocument {
             start_char_offset as usize,
             end_cell_para_idx as usize,
             end_char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 컨트롤 객체(표, 이미지, 도형)를 내부 클립보드에 복사한다.
@@ -3943,7 +4578,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             control_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 내부 클립보드에 컨트롤(표/그림/도형)이 포함되어 있는지 확인한다.
@@ -3966,7 +4602,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 내부 클립보드의 내용을 캐럿 위치에 붙여넣는다 (본문 문단).
@@ -3983,7 +4620,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 내부 클립보드의 내용을 표 셀 내부에 붙여넣는다.
@@ -4006,7 +4644,8 @@ impl HwpDocument {
             cell_idx as usize,
             cell_para_idx as usize,
             char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 선택 영역을 HTML 문자열로 변환한다 (본문).
@@ -4025,7 +4664,8 @@ impl HwpDocument {
             start_char_offset as usize,
             end_para_idx as usize,
             end_char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 선택 영역을 HTML 문자열로 변환한다 (셀 내부).
@@ -4050,7 +4690,8 @@ impl HwpDocument {
             start_char_offset as usize,
             end_cell_para_idx as usize,
             end_char_offset as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 컨트롤 객체를 HTML 문자열로 변환한다.
@@ -4065,7 +4706,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             control_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 컨트롤의 이미지 바이너리 데이터를 반환한다 (Uint8Array).
@@ -4080,7 +4722,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             control_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 컨트롤의 이미지 MIME 타입을 반환한다.
@@ -4095,7 +4738,8 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             control_idx as usize,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// HTML 문자열을 파싱하여 캐럿 위치에 삽입한다 (본문).
@@ -4112,7 +4756,8 @@ impl HwpDocument {
             para_idx as usize,
             char_offset as usize,
             html,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// HTML 문자열을 파싱하여 셀 내부 캐럿 위치에 삽입한다.
@@ -4135,7 +4780,8 @@ impl HwpDocument {
             cell_para_idx as usize,
             char_offset as usize,
             html,
-        ).map_err(|e| e.into())
+        )
+        .map_err(|e| e.into())
     }
 
     /// 문단별 줄 폭 측정 진단 (WASM)
@@ -4150,10 +4796,7 @@ impl HwpDocument {
     }
 }
 
-
 pub(crate) mod event;
-
-
 
 /// WASM 뷰어 컨트롤러 (뷰포트 관리 + 스케줄링)
 #[wasm_bindgen]
@@ -4171,7 +4814,10 @@ impl HwpViewer {
     pub fn new(document: HwpDocument) -> Self {
         let page_count = document.page_count();
         let scheduler = RenderScheduler::new(page_count);
-        Self { document, scheduler }
+        Self {
+            document,
+            scheduler,
+        }
     }
 
     /// 뷰포트 업데이트 (스크롤/리사이즈 시 호출)
@@ -4238,8 +4884,7 @@ impl HwpDocument {
     /// 문서 내 모든 책갈피 목록 반환
     #[wasm_bindgen(js_name = getBookmarks)]
     pub fn get_bookmarks(&self) -> Result<String, JsValue> {
-        self.core.get_bookmarks_native()
-            .map_err(|e| e.into())
+        self.core.get_bookmarks_native().map_err(|e| e.into())
     }
 
     /// 책갈피 추가
@@ -4251,9 +4896,9 @@ impl HwpDocument {
         char_offset: u32,
         name: &str,
     ) -> Result<String, JsValue> {
-        self.core.add_bookmark_native(
-            sec as usize, para as usize, char_offset as usize, name,
-        ).map_err(|e| e.into())
+        self.core
+            .add_bookmark_native(sec as usize, para as usize, char_offset as usize, name)
+            .map_err(|e| e.into())
     }
 
     /// 책갈피 삭제
@@ -4264,9 +4909,9 @@ impl HwpDocument {
         para: u32,
         ctrl_idx: u32,
     ) -> Result<String, JsValue> {
-        self.core.delete_bookmark_native(
-            sec as usize, para as usize, ctrl_idx as usize,
-        ).map_err(|e| e.into())
+        self.core
+            .delete_bookmark_native(sec as usize, para as usize, ctrl_idx as usize)
+            .map_err(|e| e.into())
     }
 
     /// 책갈피 이름 변경
@@ -4278,9 +4923,9 @@ impl HwpDocument {
         ctrl_idx: u32,
         new_name: &str,
     ) -> Result<String, JsValue> {
-        self.core.rename_bookmark_native(
-            sec as usize, para as usize, ctrl_idx as usize, new_name,
-        ).map_err(|e| e.into())
+        self.core
+            .rename_bookmark_native(sec as usize, para as usize, ctrl_idx as usize, new_name)
+            .map_err(|e| e.into())
     }
 }
 

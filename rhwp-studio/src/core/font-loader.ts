@@ -11,14 +11,8 @@ interface FontEntry {
   file: string;
   /** woff2(기본) 또는 woff — CDN woff 파일용 */
   format?: 'woff2' | 'woff';
-}
-
-export interface FontLoadReport {
-  loaded: number;
-  failed: number;
-  total: number;
-  /** OS 폰트/웹폰트 어디로도 확보되지 않은 핵심 서체 목록 */
-  missingCriticalFonts: string[];
+  /** CSS unicode-range — 지정 시 해당 코드포인트만 매칭, 다운로드도 해당 영역 사용 시에만 발생 */
+  unicodeRange?: string;
 }
 
 // 함초롬체 CDN (눈누 jsdelivr — 비상업적 사용 허용, 한컴 라이선스)
@@ -46,21 +40,21 @@ const FONT_LIST: FontEntry[] = [
   { name: 'HY그래픽', file: 'fonts/NotoSansKR-Regular.woff2' },
   { name: 'HYGraphic-Medium', file: 'fonts/NotoSansKR-Regular.woff2' },
   { name: 'HY그래픽M', file: 'fonts/NotoSansKR-Regular.woff2' },
-  { name: 'HY견명조', file: CDN_HAMCHOB_B, format: 'woff' },
+  { name: 'HY견명조', file: 'fonts/NotoSerifKR-Bold.woff2' },
   { name: 'HYMyeongJo-Extra', file: 'fonts/NotoSerifKR-Bold.woff2' },
-  { name: 'HY신명조', file: CDN_HAMCHOB_R, format: 'woff' },
-  { name: 'HY중고딕', file: CDN_HAMCHOD_R, format: 'woff' },
+  { name: 'HY신명조', file: 'fonts/NotoSerifKR-Regular.woff2' },
+  { name: 'HY중고딕', file: 'fonts/NotoSansKR-Regular.woff2' },
   { name: '양재튼튼체B', file: 'fonts/NotoSansKR-Bold.woff2' },
   // === 한글 시스템 폰트 → 오픈소스 대체 (OS 폰트 없을 때 폴백) ===
   { name: 'Malgun Gothic', file: 'fonts/Pretendard-Regular.woff2' },
   { name: '맑은 고딕', file: 'fonts/Pretendard-Regular.woff2' },
-  { name: '돋움', file: CDN_HAMCHOD_R, format: 'woff' },
-  { name: '돋움체', file: CDN_HAMCHOD_R, format: 'woff' },
-  { name: '굴림', file: CDN_HAMCHOD_R, format: 'woff' },
-  { name: '굴림체', file: CDN_HAMCHOD_R, format: 'woff' },
-  { name: '새굴림', file: CDN_HAMCHOD_R, format: 'woff' },
-  { name: '바탕', file: CDN_HAMCHOB_R, format: 'woff' },
-  { name: '바탕체', file: CDN_HAMCHOB_R, format: 'woff' },
+  { name: '돋움', file: 'fonts/NotoSansKR-Regular.woff2' },
+  { name: '돋움체', file: 'fonts/NotoSansKR-Regular.woff2' },
+  { name: '굴림', file: 'fonts/NotoSansKR-Regular.woff2' },
+  { name: '굴림체', file: 'fonts/D2Coding-Regular.woff2' },
+  { name: '새굴림', file: 'fonts/NotoSansKR-Regular.woff2' },
+  { name: '바탕', file: 'fonts/NotoSerifKR-Regular.woff2' },
+  { name: '바탕체', file: 'fonts/D2Coding-Regular.woff2' },
   { name: '궁서', file: 'fonts/GowunBatang-Regular.woff2' },
   { name: '궁서체', file: 'fonts/GowunBatang-Regular.woff2' },
   { name: '새궁서', file: 'fonts/GowunBatang-Regular.woff2' },
@@ -105,22 +99,21 @@ const FONT_LIST: FontEntry[] = [
   // === Gowun (OFL, 로컬) ===
   { name: '고운바탕', file: 'fonts/GowunBatang-Regular.woff2' },
   { name: '고운돋움', file: 'fonts/GowunDodum-Regular.woff2' },
+  // === Source Han Serif K Old Hangul (Task #528, OFL, 로컬, 옛한글 자모 한정 subset) ===
+  // PUA 옛한글 (HanCom 자체 인코딩) 을 KS X 1026-1:2007 자모 시퀀스로 변환 후
+  // 합자 렌더링용. unicode-range 로 옛한글 영역에서만 매칭 → 일반 한글 영향 0.
+  {
+    name: 'Source Han Serif K Old Hangul',
+    file: 'fonts/SourceHanSerifK-OldHangul-subset.woff2',
+    unicodeRange: 'U+1100-11FF, U+A960-A97F, U+D7B0-D7FF',
+  },
 ];
 
 /** @font-face에 등록된 폰트 이름 Set */
 export const REGISTERED_FONTS = new Set(FONT_LIST.map(f => f.name));
 
-/** 초기 렌더링에 필수인 폰트 (대부분의 HWP 문서 기본/레거시 서체) */
-const CRITICAL_FONTS = new Set([
-  '함초롬바탕',
-  '함초롬돋움',
-  'HY신명조',
-  'HY중고딕',
-  'HY견명조',
-  '돋움',
-  '바탕',
-  '굴림',
-]);
+/** 초기 렌더링에 필수인 폰트 (대부분의 HWP 문서 기본 서체) */
+const CRITICAL_FONTS = new Set(['함초롬바탕', '함초롬돋움']);
 
 /** CSS @font-face 등록 여부 (중복 등록 방지) */
 let fontFaceRegistered = false;
@@ -173,7 +166,7 @@ export function getDetectedOSFonts(): ReadonlySet<string> {
 export async function loadWebFonts(
   docFonts?: string[],
   onProgress?: (loaded: number, total: number) => void,
-): Promise<FontLoadReport> {
+): Promise<void> {
   // 0) OS 폰트 감지 (@font-face 등록 전에 실행해야 정확)
   if (!fontFaceRegistered) {
     detectOSFonts();
@@ -184,21 +177,16 @@ export async function loadWebFonts(
     const style = document.createElement('style');
     style.textContent = FONT_LIST.map(f => {
       const fmt = f.format ?? 'woff2';
-      // 가능하면 로컬 설치 폰트를 우선 사용해 원본 문서와 메트릭 차이를 줄인다.
-      return `@font-face { font-family: "${f.name}"; src: local("${f.name}"), url("${f.file}") format("${fmt}"); font-display: swap; }`;
+      const ur = f.unicodeRange ? ` unicode-range: ${f.unicodeRange};` : '';
+      return `@font-face { font-family: "${f.name}"; src: url("${f.file}") format("${fmt}"); font-display: swap;${ur} }`;
     }).join('\n');
     document.head.appendChild(style);
     fontFaceRegistered = true;
   }
 
-  // 2) 로드 대상 결정
-  //    - docFonts가 있으면: 문서 사용 폰트 + CRITICAL
-  //    - docFonts가 없으면: 전체 등록 폰트 (초기 부팅/디버그 경로)
+  // 2) 로드 대상 결정: docFonts에 포함된 폰트 + CRITICAL만 로드
   //    OS에 설치된 폰트는 웹폰트 로딩 건너뜀
-  const targetSet =
-    docFonts && docFonts.length > 0
-      ? new Set([...(docFonts ?? []), ...CRITICAL_FONTS])
-      : new Set(CRITICAL_FONTS);
+  const targetSet = new Set([...(docFonts ?? []), ...CRITICAL_FONTS]);
   const toLoad = FONT_LIST.filter(f => {
     if (!targetSet.has(f.name)) return false;
     // OS에 동일 이름 폰트가 있으면 웹폰트 로딩 불필요
@@ -216,22 +204,7 @@ export async function loadWebFonts(
     }
   }
 
-  if (uniqueToLoad.length === 0) {
-    const missingCriticalFonts = FONT_LIST
-      .filter((f) => CRITICAL_FONTS.has(f.name))
-      .map((f) => f.name)
-      .filter((name) => !detectedOSFonts.has(name))
-      .filter((name) => {
-        const entry = FONT_LIST.find((x) => x.name === name);
-        return entry ? !loadedFiles.has(entry.file) : true;
-      });
-    return {
-      loaded: 0,
-      failed: 0,
-      total: 0,
-      missingCriticalFonts,
-    };
-  }
+  if (uniqueToLoad.length === 0) return;
 
   const total = uniqueToLoad.length;
   console.log(`[FontLoader] 웹폰트 로드 시작: ${total}개 woff2 (이미 로드됨: ${loadedFiles.size}개)`);
@@ -273,19 +246,5 @@ export async function loadWebFonts(
     }
   }
 
-  const missingCriticalFonts = FONT_LIST
-    .filter((f) => CRITICAL_FONTS.has(f.name))
-    .map((f) => f.name)
-    .filter((name) => !detectedOSFonts.has(name))
-    .filter((name) => {
-      const entry = FONT_LIST.find((x) => x.name === name);
-      return entry ? !loadedFiles.has(entry.file) : true;
-    });
   console.log(`[FontLoader] 폰트 로드 완료: ${loaded}개 성공, ${failed}개 실패 (총 ${loadedFiles.size}개 woff2 로드됨)`);
-  return {
-    loaded,
-    failed,
-    total,
-    missingCriticalFonts,
-  };
 }

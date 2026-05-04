@@ -53,6 +53,7 @@ export interface CompareParaSnapshot {
   text: string;
   normalizedText: string;
   controlCount: number;
+  /** 정규화 텍스트·컨트롤 개수·(WASM 가능 시)문단 모양 `ParaProperties` 요약을 묶은 digest — 앵커·유일 시그니처 매칭용 */
   signature: string;
   isAnchorCandidate: boolean;
   anchor?: DiffAnchor;
@@ -101,7 +102,7 @@ export interface DiffItem {
   /** 좌/우 문서 기준 구역 내 쪽 번호 (1-base) */
   leftSectionPage?: number;
   rightSectionPage?: number;
-  /** 정체성 매칭 후 문단 내부 문자 단위 요약(Myers) */
+  /** 정체성 매칭 후 문단 내부 문자 단위 요약(`myersCharDiffSummary`: Levenshtein·Hirschberg·`CHAR_DIFF_*` 상한) */
   inlineTextDiff?: string;
 }
 

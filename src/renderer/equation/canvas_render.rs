@@ -17,7 +17,9 @@ pub fn render_equation_canvas(
     color: &str,
     base_font_size: f64,
 ) {
-    render_box(ctx, layout, origin_x, origin_y, color, base_font_size, false, false);
+    // 진입점 default: italic=true (hwpeq 변수 기본 스타일).
+    // FontStyle::Roman(`rm`) 적용 영역에서는 자식 렌더링 시 italic=false 로 전환된다.
+    render_box(ctx, layout, origin_x, origin_y, color, base_font_size, true, false);
 }
 
 fn render_box(
@@ -41,7 +43,12 @@ fn render_box(
         }
         LayoutKind::Text(text) => {
             let fi = font_size_from_box(lb, fs);
-            set_font(ctx, fi, true, bold);
+            // CJK 문자는 italic 미적용. FontStyle::Roman(`rm`)으로 italic=false 가
+            // 전달된 경우에도 italic 미적용 (svg_render.rs Text arm 과 동일 정책).
+            let has_cjk = text.chars().any(|c| matches!(c,
+                '\u{3000}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{AC00}'..='\u{D7AF}'
+            ));
+            set_font(ctx, fi, !has_cjk && italic, bold);
             ctx.set_fill_style_str(color);
             let _ = ctx.fill_text(text, x, y + lb.baseline);
         }
@@ -73,8 +80,8 @@ fn render_box(
         }
         LayoutKind::Fraction { numer, denom } => {
             render_box(ctx, numer, x, y, color, fs, italic, bold);
-            // 분수선
-            let line_y = y + lb.baseline;
+            // 분수선 — baseline에서 axis_height 위에 배치 (SVG 경로와 동일)
+            let line_y = y + lb.baseline - fs * super::layout::AXIS_HEIGHT;
             let line_thick = fs * 0.04;
             ctx.set_stroke_style_str(color);
             ctx.set_line_width(line_thick);
@@ -83,6 +90,10 @@ fn render_box(
             ctx.line_to(x + lb.width - fs * 0.05, line_y);
             ctx.stroke();
             render_box(ctx, denom, x, y, color, fs, italic, bold);
+        }
+        LayoutKind::Atop { top, bottom } => {
+            render_box(ctx, top, x, y, color, fs, italic, bold);
+            render_box(ctx, bottom, x, y, color, fs, italic, bold);
         }
         LayoutKind::Sqrt { index, body } => {
             let sign_h = lb.height;
@@ -140,8 +151,11 @@ fn render_box(
             }
         }
         LayoutKind::Limit { is_upper, sub } => {
+            // [Task PR #396 후속] SVG 경로 (svg_render.rs::Limit) 와 동일하게 base font_size 사용.
+            // font_size_from_box(lb, fs) 는 lb.height 를 사용하는데, Limit 의 lb 는 "lim + 첨자"
+            // 전체 높이라 base 의 1.5~2 배가 되어 lim 글자가 비정상으로 커지는 정황.
             let name = if *is_upper { "Lim" } else { "lim" };
-            let fi = font_size_from_box(lb, fs);
+            let fi = fs;
             set_font(ctx, fi, false, false);
             ctx.set_fill_style_str(color);
             let _ = ctx.fill_text(name, x, y + fi * 0.8);

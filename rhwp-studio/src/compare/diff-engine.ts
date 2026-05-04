@@ -1,78 +1,68 @@
 /**
- * 원본 오픈소스 대비 이력/비교 확장 (상세)
+ * HWP 문서 비교 엔진 — 문단 정렬(alignment), 문자 단위 diff, 표·도형·그림 등 컨트롤 diff를 한 모듈에서 처리한다.
  *
- * [배경]
- * - 기존 bytes 중심 비교는 파일을 다시 로드하는 순간 문단 정체성(stable_id)이 끊겨
- *   `sharedStableIdCount=0`으로 떨어지고, alignment 의존이 커져 "밀림"이 자주 발생했다.
+ * ── [용어] “밀림(shift)”
+ * 한쪽에 문단·표가 삽입되면 이후 문단의 `section`/`paragraph`/`globalIndex`가 통째로 밀린다.
+ * 텍스트는 내용 기반 정렬로 상쇄할 수 있으나, 컨트롤 키에 물리 위치가 남으면 표/도형이 “삭제+추가”로
+ * 쪼개져 보이는 문제가 생긴다. 이 파일은 (A) 문단 쪽 밀림 완화 (B) 정렬 결과를 컨트롤에 전달 두 축으로 대응한다.
  *
- * [설계 철학 — 도메인 분리]
- * - 이력(같은 혈통): sid(stable_id)로 문단 정체성을 유지하면 구조·텍스트가 크게 바뀌어도
- *   `identity` 경로에서 O(N)에 가깝게 "이 문단 ↔ 저 문단"을 확정할 수 있다.
- * - 외부 문서 비교(다른 혈통): 두 HWP 간에 공유 sid가 없으므로 `alignment`만 쓴다.
- *   유일하고 긴 문단을 앵커로 "가짜 뼈대"를 세우고, 그 사이 구간을 DP/그리디로 채운다.
+ * ── [도메인 분리: identity vs alignment]
+ * - **이력(같은 혈통)**: `stable_id`가 양쪽에 공유되면 `identity` 경로로 문단 1:1을 직접 잡는다(O(N) 수준).
+ * - **외부 문서(다른 혈통)**: 공유 sid가 없으므로 `alignment`만 사용한다. 유일·긴 문단과 섹션 제목류를
+ *   **글로벌 앵커**로 써 문서를 구간으로 쪼개고, 구간 안은 DP/그리디로 채운다.
  *
- * [설계 철학 — 단계적 비교 (성능·정확도)]
- * - 1단계(구조 뼈대): 앵커로 문서를 큰 구간으로 나눈다. 전 문단×문단 유사도 행렬(O(N²))로
- *   최고 점만 맞추는 방식은 피한다(브라우저 부담 + "1. 개요" 같은 반복 문구 오매칭).
- * - 2단계(구조적 짝짓기): 구간 안에서 순서를 최대한 유지하며 1:1 정렬; "추가 vs 수정"의
- *   대부분은 여기서 결정된다. 유사도는 이 단계에서 DP 치환 비용 하한 등 '가중치' 역할.
- * - 3단계(디테일): 짝이 맞은 문단 쌍에만 문자 단위 요약(`myersCharDiffSummary` 등)을 적용.
+ * ── [문단 밀림 완화 — alignment 내부 계층]
+ * 1. **글로벌 앵커** (`buildAnchorPairs`, `fillSnapshotFromWasm`의 `isAnchorCandidate`)
+ *    - 시그니처가 좌·우 각각 한 번만 등장하는 문단만 앵커 후보.
+ *    - 길이·엔트로피 등 `isAnchorTextQualityOk`로 짧은 반복 문장을 걸러 오염 앵커를 막는다.
+ *    - `[테스트 N: …]` 같은 짧은 제목은 `isStructuralBlockTitleLine` 등으로 후보로 올리되,
+ *      `buildBothSidesUniqueTrimNorm`으로 **trim 본문이 양쪽 문서에서 정확히 한 번씩**일 때만 글로벌 앵커로 승인.
+ * 2. **구간 정렬** (`matchSegment` 재귀 트리)
+ *    - `buildUniqueSigPairsInSlices`: 구간 안에서만 시그니처 빈도를 세 **내부 Patience 핀**으로 쪼갠다.
+ *    - `tryMatchByNormHashPins`: 서명 핀이 없을 때 `normalizedText` 해시 토큰으로 거시 핀(DMP line-mode 유사).
+ *    - `matchSegmentDp` / `findLongestEqualSignatureRun` / `matchWindowedGreedy`: 셀 수·시간 한도에 따라 선택.
+ * 3. **상대 구조 근접** (`SegmentAnchorBoundary` + `runWithSegmentStructBase` + `isNearStructure`)
+ *    - 구간마다 직전 글로벌 앵커 쌍의 `globalIndex`를 베이스로 잡고, `|Δleft - Δright| ≤ 2`로 본다.
+ *    - 문서 맨 앞 구간은 베이스가 구간 **첫 문단**이다. 절대 인덱스만 보면 큰 밀림 직후 이웃 문단이
+ *      구조적으로 가깝다고 인정받지 못하는 문제를 줄인다.
+ * 4. **DP 비용** (`matchCost`, `getEffectiveSimilarity`, `softSimilarityThresholdForPair`)
+ *    - 유사도는 “전역 라벨”이 아니라 치환 비용·약매칭 방지용 가중치로만 쓴다.
  *
- * [설계 철학 — 유사도는 안전망]
- * - 1차 라벨의 주역으로 쓰지 않는다. 정렬(DP) 단계에서는 치환 비용·약매칭 방지 등에만 쓴다.
+ * ── [컨트롤 밀림 완화]
+ * - 1차: `kind::key` 정확 일치(`sid:…` 우선).
+ * - 2차: **`buildRightToLeftParaMapFromAligned`** — `buildTextDiffs`가 만든 문단 정렬 `AlignedPair[]`에서
+ *   오른쪽 `section:paragraph` → 짝 왼쪽 문단 맵을 구축해 `buildControlDiffs`에 전달한다.
+ * - 3차: **`pairAlignmentSlotControls`** — 키가 어긋린 뒤에도, 오른쪽 컨트롤의 부모 문단이 맵상으로
+ *   어느 왼쪽 문단과 짝인지 알면 **그 왼쪽 문단에 붙은 미매칭 컨트롤만** 후보로 삼고
+ *   `scoreControlFallback + ALIGNMENT_CONTROL_SLOT_BONUS`로 짝을 찾는다(절대 y 밀림 보정).
+ * - 4차: `extractTablePatiencePins`(표 요약 유일 키) → `pairControlsFallback`(전역 탐욕, 임계 2.75).
  *
- * [alignment 파이프라인 요약 — 문서 비교(alignment) 경로]
- * 1) `buildAnchorPairs`: 양쪽에서 시그니처·품질이 유일한 "긴" 문단 쌍만 글로벌 앵커로 고정.
- * 2) 앵커 사이 구간마다 `matchSegment` → (셀 수·시간 한도 내) `matchSegmentDp` 또는 `matchWindowedGreedy`.
- *    - DP: `matchCost` = `getEffectiveSimilarity` + `softSimilarityThresholdForPair` + `MATCH_COST_WEAK`.
- *    - Greedy: `scorePairGreedy` + 윈도 + `minScore` + (1위가 `isNearStructure`면 `ambiguous` 생략).
- * 3) `buildTextDiffs`: 정렬된 `AlignedPair` 스트림을 순회하며 빈문단 승격·쪼개기 라벨·삭제+추가→수정
- *    병합(`shouldMergeRemovedAddedAsModify`) 등 후처리 후 `DiffItem[]` 생성.
- * - `isNearStructure`는 `globalIndex` 차 ≤2라 위쪽 삽입으로 밀리면 false가 되기 쉬움 → 그 경우에도
- *   `(L,null)(null,R)` 연속은 REMOVED_ADDED_* 규칙으로 "텍스트 변경" 승격 가능.
+ * ── [단계적 비교(성능)]
+ * - 전 문단×문단 유사도 행렬 같은 O(N²) 전역 최적화는 하지 않는다.
+ * - 짝이 맞은 문단에만 `myersCharDiffSummary`(접두·접미 제거, Hirschberg, `CHAR_DIFF_*` 상한)를 적용한다.
  *
- * [튜닝 상수 읽는 법 — 파일 상단 `// ─── 튜닝 상수` 블록]
- * - 앵커/윈도: WINDOW_SIZE, ANCHOR_*, SEGMENT_DP_MAX, HARD_SEGMENT_CELL_LIMIT, ALIGNMENT_MAX_COMPUTE_MS
- * - 유사도·비용: MATCH_SOFT_SIM_MIN, MATCH_COST_WEAK, NEAR_STRUCTURE_*, textSimilarity 가중(0.2/0.8)
- * - 그리디: NEAR_STRUCTURE_GREEDY_BONUS, GREEDY_AMBIGUOUS_GAP, minScore(함수 내 리터럴 3.45)
- * - 후처리: PARA_SPLIT_JOIN_SIM_MIN, REMOVED_ADDED_* (삭제+추가 병합)
+ * ── [튜닝 상수 — `// ─── 튜닝 상수` 블록]
+ * - 앵커·구간: ANCHOR_*, INTRA_UNIQUE_SIG_*, SEGMENT_DP_MAX, NORM_HASH_PIN_MIN_TOTAL_PARAS, HARD_SEGMENT_CELL_LIMIT,
+ *   ALIGNMENT_MAX_COMPUTE_MS, MAX_SEGMENT_RECURSION
+ * - 구조 근접·비용: NEAR_STRUCTURE_*, MATCH_SOFT_SIM_MIN, MATCH_COST_WEAK, WINDOW_SIZE, GREEDY_AMBIGUOUS_GAP
+ * - 컨트롤 슬롯: ALIGNMENT_CONTROL_SLOT_BONUS, ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE
+ * - 후처리: PARA_SPLIT_JOIN_SIM_MIN, REMOVED_ADDED_*
+ * - 문자 요약: CHAR_DIFF_FULL_DP_MAX, CHAR_DIFF_TOTAL_MAX, CHAR_DIFF_CELL_HARD
  *
- * [핵심 확장]
- * 1) 입력 경로 이원화
- *    - `buildSnapshotFromBytes`: 외부 파일(bytes) 비교용
- *    - `buildSnapshotFromWasm`: 현재 편집 문서를 IR 스냅샷(JSON)으로 직접 채집
- *      -> 같은 세션 내 이력 비교에서 sid를 보존해 identity 매칭률을 높인다.
+ * ── [입력 경로]
+ * - `buildSnapshotFromBytes`: 외부 파일 비교.
+ * - `buildSnapshotFromWasm`: 편집기 IR — 같은 세션 이력에서 sid 보존에 유리.
  *
- * 2) 전략 명시 선택
- *    - 이력 비교는 `identity`, 문서 비교는 `alignment`를 호출부에서 명시한다.
- *    - identity에 필요한 sid 맵 구성 실패 시에만 alignment로 안전 폴백한다.
+ * ── [공개 진입점]
+ * - `compareSnapshots`: 전략 선택 → 본문 diff → 컨트롤 diff(맵 전달) → 필터·쪽번호·정렬.
+ * - `compareDocuments`: bytes 두 개를 스냅샷으로 만든 뒤 위와 동일.
  *
- * 3) 컨트롤(표/그림) 매칭 안정화
- *    - 위치 기반 키(`sec:para:idx`) 대신 부모 문단 sid를 포함한 키를 우선 사용한다.
- *      예: `sid:<paraStableId>:<ctrlIdx>:<type>`
- *    - 문단 번호가 밀려도 같은 개체를 같은 개체로 추적하기 위한 변경이다.
- *
- * 4) 렌더/페이지 정보 보강
- *    - 스냅샷 시점에 페이지 표시 번호를 수집해 diff 항목에 좌/우 sectionPage를 주석화한다.
- *    - 컨트롤/메타 항목처럼 문단 직접 매핑이 불안정한 경우 anchor/page 매핑으로 보완한다.
- *
- * 5) 이동 오탐 억제
- *    - 엔터/삽입으로 인한 단순 reflow를 `paragraphMeta moved`로 과검출하지 않도록 후처리한다.
- *
- * [유지보수·리뷰 포인트]
- * - 이 파일은 "비교 품질(정확성) + UI 탐색성(경로/앵커)"를 함께 책임진다.
- * - 비교 품질 이슈를 수정할 때는 `compareSnapshots` 진입 전후 로그(①②③)를 함께 확인해야 한다.
- * - 아키텍처 설명·발표 시에는 위 단계(앵커→정렬→문자)로 브라우저 비용을 어떻게 막는지
- *   시각적으로 보여주는 것이 효과적이다.
- *
- * [본 파일 구획]
- * 아래부터 논리 블록마다 `// ─── …` 주석으로 섹션을 나눴다. 점프 검색(`───`)으로 이동하면 된다.
- * 순서: 튜닝 상수 → 런타임 가드 → 유틸(정규화/해시) → 컨트롤 키·표 요약 → 스냅샷 수집 →
- * stable_id·identity → 전략·reflow 필터 → alignment(DP/그리디) → 본문 diff 후처리 →
- * 컨트롤 diff·쪽번호 주석 → `compareSnapshots` 진입점.
+ * ── [유지보수]
+ * - 품질 이슈 시 compare-debug 로그 ① stable_id ② 전략 ③ 앵커를 함께 본다.
+ * - 본 파일은 `// ───` 섹션 구분으로 점프 검색이 가능하다.
  */
 import { WasmBridge } from '@/core/wasm-bridge';
-import type { DocumentInfo } from '@/core/types';
+import type { DocumentInfo, ParaProperties } from '@/core/types';
 import { compareDbg, isCompareDebugEnabled } from './compare-debug';
 import type {
   CompareAnchorTuning,
@@ -89,15 +79,26 @@ import type {
 } from './types';
 
 // ═══ 튜닝·런타임 가드 ═══════════════════════════════════════════════════════
-// alignment 비용/품질은 이 상수들에 강하게 묶여 있다. README §9·파일 상단 설계 주석과 같이 볼 것.
+// alignment·컨트롤 슬롯 매칭의 비용/품질은 아래 상수에 강하게 묶여 있다.
+// 튜닝 변경 후에는 통합 테스트용 HWP(앵커·표 삽입·밀림)으로 회귀 확인하는 것을 권장한다.
+// 파일 맨 위 블록 주석(용어·파이프라인)과 이 표를 같이 읽으면 의도가 정리된다.
 
 // ─── 튜닝 상수 (값 변경 시 대표 문서로 회귀 확인 권장) ─────────────────
-// 상호 의존: NEAR_STRUCTURE_* 는 isNearStructure 가 true 일 때만 전부 켜짐.
-//           밀린 문단은 isNear 가 false 가 되므로 REMOVED_ADDED_* 가 보완층으로 동작한다.
+// 상호 의존:
+// - NEAR_STRUCTURE_* 는 `isNearStructure`가 true일 때만 DP/그리디에 반영된다.
+// - 큰 밀림 직후에도 구간 베이스(`SegmentAnchorBoundary`)가 맞으면 isNear가 true가 되기 쉬워져
+//   치환 비용 할인·유사도 완화가 켜진다.
+// - 그래도 (L,null)(null,R) 패턴으로 남는 구간은 REMOVED_ADDED_* 로 “한 슬롯 수정”으로 승격할 수 있다.
 /** alignment 경로: 오른쪽 문단마다 왼쪽에서 고를 때의 탐색 반경(문단 개수) */
 const WINDOW_SIZE = 32;
 /** `buildAnchorPairs`: 시그니처가 같아도 너무 짧은 문단은 앵커 후보에서 제외(오탐 앵커 방지) */
 const ANCHOR_MIN_TEXT_LEN = 20;
+/** `[테스트 N: …]` 등 짧은 블록 제목을 앵커로 쓸 때 최소 글자 수(공백 제거 `trim` 기준) */
+const STRUCTURAL_ANCHOR_MIN_LEN = 5;
+/** 최상위 구간 `buildUniqueSigPairsInSlices` 최소 문단 길이 */
+const INTRA_UNIQUE_SIG_MIN_TOP = 10;
+/** 글로벌 앵커로 이미 자른 하위 구간에서 내부 유일 시그니처 핀의 최소 길이 */
+const INTRA_UNIQUE_SIG_MIN_NESTED = 4;
 /** 동일 서명 문단 쌍의 globalIndex 차가 이 값보다 크면 "문단 이동" 메타 후보로 본다 */
 const MOVE_DISTANCE_THRESHOLD = 3;
 /** 정렬이 (null,R앞)(L,R뒤)로 나온 쪼개기만: L≈R앞+R뒤일 때 R앞=변경·R뒤=추가로 재라벨 */
@@ -123,8 +124,12 @@ const REMOVED_ADDED_MERGE_SIM_MIN = 0.28;
 /** 위 승격: 같은 구역에서 허용하는 문단 번호·globalIndex 최대 간격(위쪽 삽입으로 밀린 경우) */
 const REMOVED_ADDED_MAX_PARA_GAP = 12;
 const REMOVED_ADDED_MAX_GLOBAL_GAP = 24;
-/** `myersCharDiffSummary`: 문자 단위 DP를 돌릴 최대 문자열 길이(메모리·시간 상한) */
-const MYERS_MAX = 420;
+/** 문자 diff: 이 이하의 n×m만 전역 DP 역추적(Hirschberg 잎) */
+const CHAR_DIFF_FULL_DP_MAX = 280_000;
+/** 좌+우 길이 합 상한 — 그 이상은 요약 생략(메인 스레드 보호) */
+const CHAR_DIFF_TOTAL_MAX = 96_000;
+/** n×m 셀 상한 — 평균 케이스에서도 과도한 O(nm) 방지 */
+const CHAR_DIFF_CELL_HARD = 14_000_000;
 /** 앵커 품질 기본 가드레일: 공백 비율 상한 */
 const ANCHOR_MAX_WHITESPACE_RATIO = 0.62;
 /** 앵커 품질 기본 가드레일: 최소 고유 문자 수 */
@@ -135,6 +140,26 @@ const ANCHOR_MIN_ENTROPY = 1.9;
 const HARD_SEGMENT_CELL_LIMIT = 180_000;
 /** 브라우저 프리징 방지: alignment 타임버짓 기본값(ms) */
 const ALIGNMENT_MAX_COMPUTE_MS = 2600;
+/** `matchSegment` 재귀(내부 앵커·half-match) 최대 깊이 */
+const MAX_SEGMENT_RECURSION = 96;
+/** half-match 전수 탐색 시 n×m 상한(초과 시 half-match 생략) */
+const HALF_MATCH_MAX_PRODUCT = 450_000;
+/**
+ * `tryMatchByNormHashPins`: 서명 유일 핀이 없을 때 `normalizedText` trim을 해시 토큰으로 바꿔
+ * 구간 내 유일 쌍을 찾는 **거시** 단계. 좌·우 문단 수 합이 이 값 미만이면 오버헤드만 커져 생략한다.
+ */
+const NORM_HASH_PIN_MIN_TOTAL_PARAS = 48;
+/**
+ * `pairAlignmentSlotControls`: 문단 정렬로 이미 “같은 논리 문단”으로 묶인 표·도형에 대해
+ * `scoreControlFallback` 원점수에 더하는 보너스. 위쪽 삽입으로 앵커 y가 크게 달라져도
+ * 원점수가 2.75 근처에서 막히는 현상을 완화한다.
+ */
+const ALIGNMENT_CONTROL_SLOT_BONUS = 2.35;
+/**
+ * 슬롯 단계에서 채택하는 최소 점수 = `scoreControlFallback(l,r) + ALIGNMENT_CONTROL_SLOT_BONUS`.
+ * 너무 낮추면 다른 문단 개체와 오매칭, 너무 높이면 슬롯이 거의 동작하지 않는다.
+ */
+const ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE = 4.38;
 
 /** `compareSnapshots` 한 번 호출 동안만 유효. `ALIGNMENT_MAX_COMPUTE_MS` 경과 시 greedy 쪽으로 이탈한다. */
 type CompareRuntimeGuard = {
@@ -143,6 +168,32 @@ type CompareRuntimeGuard = {
 };
 
 let activeRuntimeGuard: CompareRuntimeGuard | null = null;
+
+/**
+ * `isNearStructure`가 쓰는 좌·우 `globalIndex` 베이스(한 쌍의 절대 인덱스).
+ * `matchSegment` 재귀 전체에서 동일 베이스를 쓰면, “구간 전체가 위에서 k칸 밀렸다”를
+ * `dL = lp.globalIndex - leftBaseGi`, `dR = rp.globalIndex - rightBaseGi`로 보고 `|dL-dR|≤2`만 검사한다.
+ */
+type SegmentStructBase = { leftBaseGi: number; rightBaseGi: number };
+/**
+ * 글로벌 앵커 한 쌍의 globalIndex. `buildTextDiffs`가 앵커 사이 슬라이스를 `matchSegment`에 넘길 때
+ * 직전 경계 앵커 `(a.li,a.ri)`가 있으면 그 문단의 인덱스를 베이스로 넣고, 문서 맨 앞 구간은 null이라
+ * 베이스가 구간의 **첫 문단** 쌍으로 대체된다(`matchSegment` 내부에서 산출).
+ */
+type SegmentAnchorBoundary = { leftAnchorGi: number; rightAnchorGi: number };
+/** `matchSegment`/`matchSegmentDp`/`matchCost` 호출 동안만 세팅. 중첩 재귀 시 스택처럼 복구한다. */
+let activeSegmentStructBase: SegmentStructBase | null = null;
+
+/** `fn` 실행 동안 `isNearStructure`가 `base` 기준 상대 오프셋을 보도록 한다. */
+function runWithSegmentStructBase<T>(base: SegmentStructBase, fn: () => T): T {
+  const prev = activeSegmentStructBase;
+  activeSegmentStructBase = base;
+  try {
+    return fn();
+  } finally {
+    activeSegmentStructBase = prev;
+  }
+}
 
 /** `CompareOptions.anchorTuning`이 있으면 그걸 쓰고, 없으면 파일 상단 기본 앵커 가드레일을 쓴다. */
 function resolveAnchorTuning(options: CompareOptions): Required<CompareAnchorTuning> {
@@ -175,16 +226,39 @@ function shannonEntropy(text: string): number {
 }
 
 /**
- * 앵커 후보 문단의 "텍스트 품질" 검사.
- * 짧은 문장·공백만 많은 문단·문자 종류가 거의 없는 문단은 반복 제목/장식에 가까워
- * 글로벌 앵커로 잡히면 뒤따르는 구간 전체 정렬이 한꺼번에 밀릴 수 있어 제외한다.
+ * 글로벌 앵커 후보 문단의 "텍스트 품질" 검사(엔트로피·공백 비율·고유 문자 수).
+ *
+ * 너무 짧거나 반복적인 줄을 앵커로 쓰면 뒤따르는 모든 구간 정렬이 한 번에 틀어질 수 있어 기본은 배제한다.
+ * 다만 `[테스트 N: …]`·`1. …` 같이 **구조적 한 줄 제목**으로 보이는 패턴(`isStructuralBlockTitleLine`)은
+ * 길이가 `STRUCTURAL_ANCHOR_MIN_LEN` 이상·`minTextLen` 미만이면 엔트로피 검사 없이 후보로 통과시킨다.
+ * 짧은 줄의 **전역 유일성**(양쪽 문서에서 trim 본문이 각각 한 번)은 `buildAnchorPairs`에서 별도로 걸러진다.
  */
 function isAnchorTextQualityOk(text: string, tuning: Required<CompareAnchorTuning>): boolean {
+  const trimmed = text.trim();
+  if (
+    trimmed.length >= STRUCTURAL_ANCHOR_MIN_LEN &&
+    trimmed.length < tuning.minTextLen &&
+    isStructuralBlockTitleLine(trimmed)
+  ) {
+    return true;
+  }
   if (text.length < tuning.minTextLen) return false;
   const whitespaceCount = (text.match(/\s/g) ?? []).length;
   if (whitespaceCount / Math.max(1, text.length) > tuning.maxWhitespaceRatio) return false;
   if (new Set(text).size < tuning.minUniqueChars) return false;
   return shannonEntropy(text) >= tuning.minEntropy;
+}
+
+/**
+ * `[테스트 N: …]`·`[제목]`·`1. 소제목` 같이 짧아도 블록 경계로 쓸 만한 한 줄 제목.
+ * 글로벌 앵커 후보는 `signature` 중복 여부로 별도 차단한다.
+ */
+function isStructuralBlockTitleLine(trimmedOneLine: string): boolean {
+  if (!trimmedOneLine) return false;
+  if (/^\[[^\]]+\]$/.test(trimmedOneLine)) return true;
+  if (/^\[[^\]]+:[^\]]+\]$/.test(trimmedOneLine)) return true;
+  if (/^\d+\.\s+/.test(trimmedOneLine)) return true;
+  return false;
 }
 
 /**
@@ -199,18 +273,93 @@ function shouldBailToGreedy(): boolean {
   return true;
 }
 
-/**
- * 동일 stable_id 문단의 문자 단위 편집 거리·간단 패턴 요약 (2-depth diff).
- * Levenshtein 전체 테이블을 돌리므로 `MYERS_MAX`로 한 변 길이를 제한한다(초과 시 요약 생략 문자열).
- */
-function myersCharDiffSummary(left: string, right: string): string {
+// ─── 문자 diff 요약 (`myersCharDiffSummary`): 접두·접미, 전역 DP 잎, Hirschberg ─
+
+/** 공통 접두·접미를 제거해 Levenshtein/Hirschberg 입력을 줄인다. */
+function stripCommonAffixChars(left: string, right: string): { a: string; b: string } {
+  let lo = 0;
+  const minLen = Math.min(left.length, right.length);
+  while (lo < minLen && left.charCodeAt(lo) === right.charCodeAt(lo)) lo += 1;
+  let suf = 0;
+  while (
+    suf < left.length - lo &&
+    suf < right.length - lo &&
+    left.charCodeAt(left.length - 1 - suf) === right.charCodeAt(right.length - 1 - suf)
+  )
+    suf += 1;
+  return { a: left.slice(lo, left.length - suf), b: right.slice(lo, right.length - suf) };
+}
+
+function levenshteinDistanceTwoRow(a: string, b: string): number {
+  const n = a.length;
+  const m = b.length;
+  if (n === 0) return m;
+  if (m === 0) return n;
+  let prev = new Array<number>(m + 1);
+  let cur = new Array<number>(m + 1);
+  for (let j = 0; j <= m; j += 1) prev[j] = j;
+  for (let i = 1; i <= n; i += 1) {
+    cur[0] = i;
+    const cAi = a.charCodeAt(i - 1);
+    for (let j = 1; j <= m; j += 1) {
+      const eq = cAi === b.charCodeAt(j - 1) ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + eq);
+    }
+    const t = prev;
+    prev = cur;
+    cur = t;
+  }
+  return prev[m];
+}
+
+/** `a[0..nrow)` vs `b` — 마지막 행 비용만 (Hirschberg 전반). `nrow===0`이면 삽입만. */
+function levenshteinLastRowPrefix(a: string, nrow: number, b: string): number[] {
+  const m = b.length;
+  if (nrow <= 0) {
+    const row = new Array<number>(m + 1);
+    for (let j = 0; j <= m; j += 1) row[j] = j;
+    return row;
+  }
+  let prev = new Array<number>(m + 1);
+  let cur = new Array<number>(m + 1);
+  for (let j = 0; j <= m; j += 1) prev[j] = j;
+  for (let i = 1; i <= nrow; i += 1) {
+    cur[0] = i;
+    const cAi = a.charCodeAt(i - 1);
+    for (let j = 1; j <= m; j += 1) {
+      const eq = cAi === b.charCodeAt(j - 1) ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + eq);
+    }
+    const t = prev;
+    prev = cur;
+    cur = t;
+  }
+  return prev;
+}
+
+/** `D[i][j]` = ed(`a[i..n)`, `b[j..m)`). `i === mid`인 행만 필요할 때 아래로 채운다. */
+function levenshteinSuffixRowAt(a: string, mid: number, b: string): number[] {
+  const n = a.length;
+  const m = b.length;
+  let cur = new Array<number>(m + 1);
+  for (let j = 0; j <= m; j += 1) cur[j] = m - j;
+  for (let i = n - 1; i >= mid; i -= 1) {
+    const next = new Array<number>(m + 1);
+    next[m] = n - i;
+    const ca = a.charCodeAt(i);
+    for (let j = m - 1; j >= 0; j -= 1) {
+      const eq = ca === b.charCodeAt(j) ? 0 : 1;
+      next[j] = Math.min(cur[j] + 1, next[j + 1] + 1, cur[j + 1] + eq);
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+/** 전체 `dp` 역추적 — `n*m`이 작을 때만 호출. */
+function charEditOpsFullDp(left: string, right: string): string {
   const n = left.length;
   const m = right.length;
-  if (n === 0 && m === 0) return '';
-  if (n * m > MYERS_MAX * MYERS_MAX) {
-    return `문자 diff 생략(과대: ${n}×${m})`;
-  }
-  // 편집 거리(Levenshtein) 테이블: dp[i][j] = left[0..i), right[0..j) 정렬 비용
   const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
   for (let i = 0; i <= n; i += 1) dp[i][0] = i;
   for (let j = 0; j <= m; j += 1) dp[0][j] = j;
@@ -223,7 +372,6 @@ function myersCharDiffSummary(left: string, right: string): string {
   let i = n;
   let j = m;
   const ops: string[] = [];
-  // 역추적: 삭제(-) / 삽입(+) / 치환(×) / 일치(=) — UI용 짧은 패턴 문자열로 압축
   while (i > 0 || j > 0) {
     if (i > 0 && j > 0 && left.charCodeAt(i - 1) === right.charCodeAt(j - 1)) {
       ops.push('=');
@@ -248,8 +396,55 @@ function myersCharDiffSummary(left: string, right: string): string {
     }
   }
   ops.reverse();
-  const pat = ops.join('').replace(/=+/g, '·').slice(0, 100);
-  return `편집거리 ${dp[n][m]} · ${pat}`;
+  return ops.join('');
+}
+
+function charEditOpsHirschberg(a: string, b: string): string {
+  const n = a.length;
+  const m = b.length;
+  if (n === 0) return '+'.repeat(m);
+  if (m === 0) return '-'.repeat(n);
+  if (n * m <= CHAR_DIFF_FULL_DP_MAX) {
+    return charEditOpsFullDp(a, b);
+  }
+  const mid = Math.max(1, Math.floor(n / 2));
+  const f = levenshteinLastRowPrefix(a, mid, b);
+  const suf = levenshteinSuffixRowAt(a, mid, b);
+  let bestJ = 0;
+  let best = Infinity;
+  for (let j = 0; j <= m; j += 1) {
+    const s = f[j] + suf[j];
+    if (s < best || (s === best && j < bestJ)) {
+      best = s;
+      bestJ = j;
+    }
+  }
+  return (
+    charEditOpsHirschberg(a.slice(0, mid), b.slice(0, bestJ)) +
+    charEditOpsHirschberg(a.slice(mid), b.slice(bestJ))
+  );
+}
+
+/**
+ * 동일 stable_id 문단의 문자 단위 편집 거리·간단 패턴 요약 (2-depth diff).
+ * 공통 접두·접미 제거 후, 작은 구간은 전역 DP, 큰 구간은 Hirschberg로 선형 메모리에 가깝게 처리한다.
+ */
+function myersCharDiffSummary(left: string, right: string): string {
+  if (left.length === 0 && right.length === 0) return '';
+  if (left.length + right.length > CHAR_DIFF_TOTAL_MAX) {
+    return `문자 diff 요약 생략(길이: ${left.length}+${right.length})`;
+  }
+  const { a, b } = stripCommonAffixChars(left, right);
+  const n = a.length;
+  const m = b.length;
+  if (n === 0 && m === 0) return '';
+  if (n * m > CHAR_DIFF_CELL_HARD) {
+    return `문자 diff 요약 생략(과대: ${n}×${m})`;
+  }
+  const dist = levenshteinDistanceTwoRow(a, b);
+  const opStr = charEditOpsHirschberg(a, b);
+  const pat = opStr.replace(/=+/g, '·').slice(0, 100);
+  return `편집거리 ${dist} · ${pat}`;
 }
 
 // ─── 정규화·해시·Diff ID (문단 시그니처·컨트롤 요약에 공통 사용) ───────────────
@@ -436,6 +631,27 @@ function extractControlIndexFromKey(key: string): number | null {
   return Number.isFinite(Number(m[1])) ? Number(m[1]) : null;
 }
 
+/** 스냅샷 문단·컨트롤의 `section`+`paragraph`를 하나의 맵 키로 묶을 때 사용한다. */
+function paraPosKey(p: { section: number; paragraph: number }): string {
+  return `${p.section}:${p.paragraph}`;
+}
+
+/**
+ * 문단 정렬 결과(`AlignedPair[]`, cleanup 이전)에서 오른쪽 문단 위치 → 짝 왼쪽 문단을 추출한다.
+ * - 키: `paraPosKey(right)` (오른쪽 HWP 좌표계).
+ * - 값: DP/그리디가 같은 논리 슬롯으로 판단한 `left` 문단.
+ * `(null, right)`·`(left, null)` 삽입/삭제 축은 맵에 넣지 않는다 → 해당 문단의 컨트롤은 슬롯 매칭 대상에서 제외되고
+ * 이후 `extractTablePatiencePins` / `pairControlsFallback` / added·removed로 처리된다.
+ */
+function buildRightToLeftParaMapFromAligned(aligned: AlignedPair[]): Map<string, CompareParaSnapshot> {
+  const m = new Map<string, CompareParaSnapshot>();
+  for (const { left, right } of aligned) {
+    if (!left || !right) continue;
+    m.set(paraPosKey(right), left);
+  }
+  return m;
+}
+
 /** `buildTableSummary` 등이 만든 `key=value` 나열을 Record로 파싱. 값에 따옴표가 있으면 제거한다. */
 function parseSummaryKV(summary: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -550,9 +766,24 @@ function buildGranularControlDiffs(
 }
 
 // ─── 스냅샷 수집: WASM 단일 문서 → CompareDocumentSnapshot ─────────────────────
+
+/** 앵커용 문단 모양 요약 — 텍스트만 같고 번호/정렬이 다른 문단을 구분한다. */
+function compactParaShapeForAnchor(pp: ParaProperties): string {
+  const q = (v: number | undefined) => (v == null || Number.isNaN(v) ? 0 : Math.round(v / 2) * 2);
+  return JSON.stringify({
+    a: pp.alignment ?? '',
+    h: pp.headType ?? '',
+    lv: pp.paraLevel ?? 0,
+    n: pp.numberingId ?? 0,
+    i: q(pp.indent),
+    ml: q(pp.marginLeft),
+  });
+}
+
 /**
  * WASM이 열린 단일 문서에서 비교용 스냅샷을 만든다.
- * - 문단: 텍스트, 정규화 텍스트, stable_id, 레이아웃 앵커(커서 rect 기반), 구역 내 쪽번호
+ * - 문단: 텍스트, 정규화 텍스트, stable_id, 레이아웃 앵커(커서 rect 기반), 구역 내 쪽번호,
+ *   `signature`(정규화 텍스트·컨트롤 개수 + `getParaPropertiesAt` 기반 문단모양 요약 `ps:`)
  * - 개체: 페이지 레이아웃 + 문단별 table 순회를 합쳐 키를 `sid:` 우선으로 통일
  * - 마지막에 `canonicalControlKey`로 중복을 합치고 `controlSnapshotQuality`로 더 나은 요약을 남긴다.
  */
@@ -576,6 +807,8 @@ function fillSnapshotFromWasm(
   }
 
   const paragraphs: CompareParaSnapshot[] = [];
+  /** 구역·문단별: 글머리/번호/개요 등 HWP `headType`이 Outline·Number인지(짧은 제목 앵커 후보용) */
+  const paraHeadOutlineOrNumber = new Map<string, boolean>();
   let globalIndex = 0;
   for (let sec = 0; sec < info.sectionCount; sec += 1) {
     const paraCount = wasm.getParagraphCount(sec);
@@ -584,8 +817,20 @@ function fillSnapshotFromWasm(
       const text = length > 0 ? wasm.getTextRange(sec, para, 0, length) : '';
       const controls = wasm.getControlTextPositions(sec, para);
       const normalizedText = normalizeText(text, options);
-      // 문단 "내용+컨트롤 개수" 지문 — alignment에서 앵커/유일쌍 찾기에 사용
-      const signature = simpleHash(`${normalizedText}|cc:${controls.length}`);
+      let shapeDigest = '';
+      try {
+        const pp = wasm.getParaPropertiesAt(sec, para);
+        shapeDigest = simpleHash(compactParaShapeForAnchor(pp));
+        const ht = pp.headType ?? 'None';
+        paraHeadOutlineOrNumber.set(`${sec}:${para}`, ht === 'Outline' || ht === 'Number');
+      } catch {
+        shapeDigest = '';
+        paraHeadOutlineOrNumber.set(`${sec}:${para}`, false);
+      }
+      // 문단 "내용+컨트롤 개수+문단모양" 지문 — alignment에서 앵커/유일쌍 찾기에 사용
+      const signature = simpleHash(
+        `${normalizedText}|cc:${controls.length}${shapeDigest ? `|ps:${shapeDigest}` : ''}`,
+      );
       const stableId = wasm.getParagraphStableId(sec, para);
       const anchor = (() => {
         try {
@@ -623,16 +868,31 @@ function fillSnapshotFromWasm(
     }
   }
 
-  // 앵커 오염 방지: 너무 짧거나 중복 텍스트(개요/빈 문단)는 앵커 후보에서 제외.
+  // 글로벌 앵커 후보(`isAnchorCandidate`): 시그니처 중복은 즉시 탈락. 그 다음
+  // - 길이·엔트로피 등으로 “긴” 문단은 `isAnchorTextQualityOk`
+  // - 짧은 제목 줄은 `[…]` / 번호 목록 패턴(`isStructuralBlockTitleLine`) 또는 HWP Outline/Number 머리
+  // `buildAnchorPairs` 단계에서 짧은 후보는 `buildBothSidesUniqueTrimNorm`으로 양쪽 각 1회만 추가 검증.
   const anchorTuning = resolveAnchorTuning(options);
   const sigCount = new Map<string, number>();
   for (const p of paragraphs) {
     sigCount.set(p.signature, (sigCount.get(p.signature) ?? 0) + 1);
   }
   for (const p of paragraphs) {
-    const hasLowQualityText = !isAnchorTextQualityOk(p.normalizedText, anchorTuning);
     const isDuplicate = (sigCount.get(p.signature) ?? 0) > 1;
-    p.isAnchorCandidate = !hasLowQualityText && !isDuplicate;
+    if (isDuplicate) {
+      p.isAnchorCandidate = false;
+      continue;
+    }
+    const t = p.normalizedText.trim();
+    const headOutlineOrNumber = paraHeadOutlineOrNumber.get(`${p.section}:${p.paragraph}`) ?? false;
+    const structBracket =
+      t.length >= STRUCTURAL_ANCHOR_MIN_LEN &&
+      t.length < anchorTuning.minTextLen &&
+      isStructuralBlockTitleLine(t);
+    const structHeading =
+      headOutlineOrNumber && t.length >= 3 && t.length < anchorTuning.minTextLen;
+    const okNormal = isAnchorTextQualityOk(p.normalizedText, anchorTuning);
+    p.isAnchorCandidate = okNormal || structBracket || structHeading;
   }
   const paraStableByPos = new Map<string, string>();
   const paraTextByPos = new Map<string, string>();
@@ -1109,6 +1369,9 @@ function suppressPureReflowMoves(
 }
 
 // ─── alignment 중간 표현: 정렬 결과 한 줄(좌만·우만·양쪽) ─────────────────────
+// `AlignedPair[]`는 `buildTextDiffs`가 앵커 경계마다 `matchSegment`를 호출해 쌓은 뒤,
+// `buildParagraphAlignStepsFromAligned` → `cleanupParagraphAlignStepsToDiffItems`로 소비된다.
+// 컨트롤 슬롯 매칭은 cleanup **이전**의 동일 배열에서 `buildRightToLeftParaMapFromAligned`로 맵만 뽑는다.
 
 /** `matchSegment*`의 출력 원소. null 쪽은 해당 문서에 문단이 없음(삽입/삭제 축). */
 type AlignedPair = {
@@ -1133,9 +1396,12 @@ function preferRightPath(
 }
 
 /**
- * **구간 한정** 유일 시그니처 앵커: `leftSeg`/`rightSeg` 안에서만 빈도를 세므로 전역 유일과는 다를 수 있다.
- * 양쪽에서 정확히 1번씩만 나오는 시그니처끼리, 오른쪽 인덱스가 단조 증가하도록 쌍을 잡는다(LCS 앵커 느낌).
- * `minTextLen`으로 너무 짧은 "우연 유일" 쌍을 줄인다.
+ * **구간 한정** 유일 시그니처 앵커(Patience / LCS 스타일).
+ *
+ * `leftSeg`·`rightSeg` **안에서만** 시그니처 빈도를 세므로, 전역적으로는 중복이어도 구간 안에서만 유일하면 핀이 된다.
+ * 양쪽에서 정확히 1번씩만 나오는 시그니처끼리 `ri`를 잡되, `ri`가 단조 증가하도록만 쌍을 채택해 교차 매칭을 막는다.
+ * `minTextLen`: 상위 구간은 `INTRA_UNIQUE_SIG_MIN_TOP`, 깊은 재귀는 `INTRA_UNIQUE_SIG_MIN_NESTED`로
+ * 짧은 줄의 우연 유일 핀을 줄인다. `tryMatchByNormHashPins`는 `minTextLen=0`으로 같은 로직을 재사용한다.
  */
 function buildUniqueSigPairsInSlices(
   leftSeg: CompareParaSnapshot[],
@@ -1172,11 +1438,43 @@ function buildUniqueSigPairsInSlices(
   return pairs;
 }
 
+/** 문서 전체에서 `normalizedText.trim()` 문자열이 몇 번 나오는지 센다(빈 문자열 제외). */
+function countTrimNormText(paras: CompareParaSnapshot[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const p of paras) {
+    const k = p.normalizedText.trim();
+    if (!k) continue;
+    m.set(k, (m.get(k) ?? 0) + 1);
+  }
+  return m;
+}
+
 /**
- * 전역 문단 배열에서 "길고 유일한" 동일 시그니처 쌍을 단조 증가하는 `ri`로만 잡아 alignment 구간 경계를 만든다.
- * 후보는 `fillSnapshotFromWasm`에서 미리 `isAnchorCandidate`로 거른다(짧은 문단·중복 시그니처 제외).
+ * trim `normalizedText` 가 왼쪽·오른쪽 문서에서 각각 정확히 한 번만 등장하는 문자열(교집합).
+ * 짧은 구조 앵커 후보가 전역적으로 우연 중복이 아닌지 확인할 때 사용한다.
  */
-function buildAnchorPairs(left: CompareParaSnapshot[], right: CompareParaSnapshot[]): Array<{ li: number; ri: number }> {
+function buildBothSidesUniqueTrimNorm(left: CompareParaSnapshot[], right: CompareParaSnapshot[]): Set<string> {
+  const cl = countTrimNormText(left);
+  const cr = countTrimNormText(right);
+  const out = new Set<string>();
+  for (const [k, v] of cl) {
+    if (v !== 1) continue;
+    if (cr.get(k) === 1) out.add(k);
+  }
+  return out;
+}
+
+/**
+ * 전역 문단 배열에서 유일한 동일 시그니처 쌍을 단조 증가하는 `ri`로만 잡아 alignment 구간 경계를 만든다.
+ * 후보는 `fillSnapshotFromWasm`에서 `isAnchorCandidate`로 거른다(기본은 길이·엔트로피, 예외는 짧은 블록 제목·Outline/Number).
+ * `minTextLen` 미만인 후보는 trim 본문이 양쪽 문서에서 각각 한 번만 나올 때만 앵커로 승인한다.
+ */
+function buildAnchorPairs(
+  left: CompareParaSnapshot[],
+  right: CompareParaSnapshot[],
+  anchorTuning: Required<CompareAnchorTuning>,
+): Array<{ li: number; ri: number }> {
+  const shortOkTrim = buildBothSidesUniqueTrimNorm(left, right);
   const rightBySig = new Map<string, number[]>();
   for (let i = 0; i < right.length; i += 1) {
     const p = right[i];
@@ -1190,6 +1488,8 @@ function buildAnchorPairs(left: CompareParaSnapshot[], right: CompareParaSnapsho
   for (let li = 0; li < left.length; li += 1) {
     const lp = left[li];
     if (!lp.isAnchorCandidate) continue;
+    const t = lp.normalizedText.trim();
+    if (t.length < anchorTuning.minTextLen && !shortOkTrim.has(t)) continue;
     const candidates = rightBySig.get(lp.signature);
     if (!candidates || candidates.length !== 1) continue; // 앵커 오염 방지: 단일 매치만 앵커로 인정
     const ri = candidates[0];
@@ -1256,17 +1556,21 @@ function textSimilarity(a: string, b: string): number {
 }
 
 /**
- * 구역·문단 번호·globalIndex·컨트롤 수가 "같은 슬롯의 이웃"으로 볼 만한 쌍.
- * - globalIndex 는 문서 전체 순서라, 위쪽 삽입만으로도 좌·우 동일 문단이 ±3 이상 벌어질 수 있음
- *   → 이 경우 getEffectiveSimilarity 부스트·그리디 가산이 꺼지고, REMOVED_ADDED_* 병합이 다음 방어선.
+ * 구역·문단 번호·(상대)globalIndex·컨트롤 수가 "같은 슬롯의 이웃"으로 볼 만한 쌍.
+ * - `matchSegment` 안에서는 `activeSegmentStructBase` 기준으로 베이스 대비 오프셋 차만 본다(베이스는 직전
+ *   글로벌 앵커 쌍이 있으면 그 `globalIndex`, 없으면 구간 첫 문단).
+ * - 그 밖(후처리 등)에서는 전역 `globalIndex` 차 ≤2를 그대로 사용한다.
  */
 function isNearStructure(lp: CompareParaSnapshot, rp: CompareParaSnapshot): boolean {
-  return (
-    lp.section === rp.section &&
-    Math.abs(lp.paragraph - rp.paragraph) <= 1 &&
-    Math.abs(lp.globalIndex - rp.globalIndex) <= 2 &&
-    lp.controlCount === rp.controlCount
-  );
+  if (lp.section !== rp.section) return false;
+  if (Math.abs(lp.paragraph - rp.paragraph) > 1) return false;
+  if (lp.controlCount !== rp.controlCount) return false;
+  if (activeSegmentStructBase) {
+    const dL = lp.globalIndex - activeSegmentStructBase.leftBaseGi;
+    const dR = rp.globalIndex - activeSegmentStructBase.rightBaseGi;
+    return Math.abs(dL - dR) <= 2;
+  }
+  return Math.abs(lp.globalIndex - rp.globalIndex) <= 2;
 }
 
 /** 공백 제거 기준 양쪽 문단이 충분히 길 때만 임계/부스트 완화(짧은 문단 노이즈 억제) */
@@ -1310,11 +1614,46 @@ function matchCost(lp: CompareParaSnapshot, rp: CompareParaSnapshot): number {
   return c;
 }
 
-/** 구간 내부 유일 시그니처 앵커로 쪼개 각 조각에 matchSegment 재귀 */
-function matchSegmentWithInternalAnchors(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSnapshot[]): AlignedPair[] {
-  const intra = buildUniqueSigPairsInSlices(leftSeg, rightSeg, 10);
-  if (intra.length === 0) return [];
+/** 원본 문단을 복제하되 `signature`만 `nh:<hash(trim)>`로 바꿔, 유일 시그니처 핀 로직을 재사용한다. */
+function paraWithNormHashSig(p: CompareParaSnapshot): CompareParaSnapshot {
+  const key = p.normalizedText.trim();
+  const h = key ? simpleHash(key) : 'empty';
+  return { ...p, signature: `nh:${h}` };
+}
 
+/**
+ * DMP `diff_lineMode_`와 비슷한 **2단계 중 거시**: 구간 문단을 줄 단위 해시 토큰으로 본 뒤
+ * `buildUniqueSigPairsInSlices(..., minTextLen=0)`로 구간 내 양쪽 유일 쌍을 핀으로 세운다.
+ * 원문 시그니처만으로는 유일 핀이 없을 때(대량 삽입으로 서명이 겹칠 때) 큰 덩어리를 가른다.
+ * `NORM_HASH_PIN_MIN_TOTAL_PARAS` 미만이면 호출하지 않는다.
+ */
+function tryMatchByNormHashPins(
+  leftSeg: CompareParaSnapshot[],
+  rightSeg: CompareParaSnapshot[],
+  depth: number,
+  anchorBoundary: SegmentAnchorBoundary | null,
+): AlignedPair[] | null {
+  const n = leftSeg.length;
+  const m = rightSeg.length;
+  if (n + m < NORM_HASH_PIN_MIN_TOTAL_PARAS) return null;
+  const lh = leftSeg.map(paraWithNormHashSig);
+  const rh = rightSeg.map(paraWithNormHashSig);
+  const intra0 = buildUniqueSigPairsInSlices(lh, rh, 0);
+  if (intra0.length === 0) return null;
+  return runInternalAnchorBoundaries(leftSeg, rightSeg, intra0, depth, anchorBoundary);
+}
+
+/**
+ * 내부 핀(`intra`)을 경계로 삼아 슬라이스를 나누고, 각 조각에 `matchSegment`를 재귀한다.
+ * `intra`는 시그니처 기반(`matchSegmentWithInternalAnchors`)이든 해시 기반(`tryMatchByNormHashPins`)이든 동일.
+ */
+function runInternalAnchorBoundaries(
+  leftSeg: CompareParaSnapshot[],
+  rightSeg: CompareParaSnapshot[],
+  intra: Array<{ li: number; ri: number }>,
+  depth: number,
+  anchorBoundary: SegmentAnchorBoundary | null,
+): AlignedPair[] {
   const boundaries = [{ li: -1, ri: -1 }, ...intra, { li: leftSeg.length, ri: rightSeg.length }];
   const out: AlignedPair[] = [];
   for (let i = 0; i < boundaries.length - 1; i += 1) {
@@ -1326,45 +1665,136 @@ function matchSegmentWithInternalAnchors(leftSeg: CompareParaSnapshot[], rightSe
     const ls = leftSeg.slice(a.li + 1, b.li);
     const rs = rightSeg.slice(a.ri + 1, b.ri);
     if (ls.length === 0 && rs.length === 0) continue;
-    out.push(...matchSegment(ls, rs));
+    out.push(...matchSegment(ls, rs, depth + 1, anchorBoundary));
   }
   return out;
 }
 
 /**
- * 앵커 사이 구간: (1) 구간 내 유일 시그니처로 분할 (2) 작은 조각은 DP (3) 크면 그리디.
+ * 구간 내부 유일 시그니처 앵커로 쪼개 각 조각에 `matchSegment` 재귀.
+ * Git patience와 유사: DP에 넘기기 전 구간을 최대한 잘게 나눈다.
  */
-function matchSegment(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSnapshot[]): AlignedPair[] {
+function matchSegmentWithInternalAnchors(
+  leftSeg: CompareParaSnapshot[],
+  rightSeg: CompareParaSnapshot[],
+  depth: number,
+  anchorBoundary: SegmentAnchorBoundary | null,
+): AlignedPair[] {
+  const intraMin = depth >= 1 ? INTRA_UNIQUE_SIG_MIN_NESTED : INTRA_UNIQUE_SIG_MIN_TOP;
+  const intra = buildUniqueSigPairsInSlices(leftSeg, rightSeg, intraMin);
+  if (intra.length === 0) return [];
+  return runInternalAnchorBoundaries(leftSeg, rightSeg, intra, depth, anchorBoundary);
+}
+
+/**
+ * 문단 시그니처가 **연속으로** 동일한 최장 구간(시작 인덱스 포함).
+ * DMP half-match 유사: 그리디 직전 큰 구간을 한 번 가른다.
+ */
+function findLongestEqualSignatureRun(
+  leftSeg: CompareParaSnapshot[],
+  rightSeg: CompareParaSnapshot[],
+): { li0: number; ri0: number; len: number } | null {
+  const n = leftSeg.length;
+  const m = rightSeg.length;
+  if (n === 0 || m === 0) return null;
+  if (n * m > HALF_MATCH_MAX_PRODUCT) return null;
+  let bestLen = 0;
+  let bestI = 0;
+  let bestJ = 0;
+  for (let i = 0; i < n; i += 1) {
+    for (let j = 0; j < m; j += 1) {
+      if (leftSeg[i].signature !== rightSeg[j].signature) continue;
+      let k = 0;
+      while (i + k < n && j + k < m && leftSeg[i + k].signature === rightSeg[j + k].signature) k += 1;
+      if (k > bestLen) {
+        bestLen = k;
+        bestI = i;
+        bestJ = j;
+      }
+    }
+  }
+  if (bestLen < 1) return null;
+  const touchesAll = bestI === 0 && bestJ === 0 && bestLen === n && bestLen === m;
+  if (touchesAll) return null;
+  const hasLeftover = bestI > 0 || bestJ > 0 || bestI + bestLen < n || bestJ + bestLen < m;
+  if (!hasLeftover) return null;
+  if (bestLen < 2 && n + m < 12) return null;
+  return { li0: bestI, ri0: bestJ, len: bestLen };
+}
+
+/**
+ * 앵커 사이(또는 재귀 하위) 한 구간의 좌·우 문단 슬라이스를 `AlignedPair[]`로 정렬한다.
+ *
+ * 순서(대략):
+ * 1. `runWithSegmentStructBase`: `anchorBoundary`가 있으면 그 앵커의 globalIndex를 구조 베이스로,
+ *    없으면 슬라이스 첫 문단 쌍을 베이스로 `isNearStructure`가 동작하게 한다.
+ * 2. 시간 가드(`shouldBailToGreedy`) → 그리디 조기 종료.
+ * 3. `buildUniqueSigPairsInSlices`로 내부 유일 시그니처 핀이 있으면 `matchSegmentWithInternalAnchors`.
+ * 4. 없으면 `tryMatchByNormHashPins`(큰 구간만).
+ * 5. 셀 수 한도 내면 `matchSegmentDp`, 아니면 `findLongestEqualSignatureRun`으로 한 번 가르고 재귀,
+ *    그것도 어렵면 `matchWindowedGreedy`.
+ */
+function matchSegment(
+  leftSeg: CompareParaSnapshot[],
+  rightSeg: CompareParaSnapshot[],
+  depth = 0,
+  anchorBoundary: SegmentAnchorBoundary | null = null,
+): AlignedPair[] {
   const n = leftSeg.length;
   const m = rightSeg.length;
   const perf = resolvePerformanceTuning(activeCompareOptions ?? DEFAULT_COMPARE_OPTIONS);
   if (n === 0 && m === 0) return [];
   if (n === 0) return rightSeg.map((rp) => ({ left: null, right: rp }));
   if (m === 0) return leftSeg.map((lp) => ({ left: lp, right: null }));
-  if (shouldBailToGreedy()) return matchWindowedGreedy(leftSeg, rightSeg);
 
-  if (n * m > SEGMENT_DP_MAX * SEGMENT_DP_MAX || n * m > perf.hardSegmentCells) {
-    // 큰 구간: 먼저 내부 유일 시그니처로 쪼개서 DP 폭발 방지
-    const stitched = matchSegmentWithInternalAnchors(leftSeg, rightSeg);
-    if (stitched.length > 0) return stitched;
-  } else {
-    const intra = buildUniqueSigPairsInSlices(leftSeg, rightSeg, 10);
-    if (intra.length > 0 && (n > 48 || m > 48)) {
-      return matchSegmentWithInternalAnchors(leftSeg, rightSeg);
+  const structBase: SegmentStructBase = anchorBoundary
+    ? { leftBaseGi: anchorBoundary.leftAnchorGi, rightBaseGi: anchorBoundary.rightAnchorGi }
+    : { leftBaseGi: leftSeg[0].globalIndex, rightBaseGi: rightSeg[0].globalIndex };
+
+  return runWithSegmentStructBase(structBase, () => {
+    if (shouldBailToGreedy()) return matchWindowedGreedy(leftSeg, rightSeg);
+
+    if (depth >= MAX_SEGMENT_RECURSION) {
+      if (n * m <= SEGMENT_DP_MAX * SEGMENT_DP_MAX && n * m <= perf.hardSegmentCells) {
+        return matchSegmentDp(leftSeg, rightSeg);
+      }
+      return matchWindowedGreedy(leftSeg, rightSeg);
     }
-  }
 
-  if (n * m <= SEGMENT_DP_MAX * SEGMENT_DP_MAX && n * m <= perf.hardSegmentCells) {
-    return matchSegmentDp(leftSeg, rightSeg);
-  }
-  // 매우 큰 조각: 윈도 그리디(정확도는 DP보다 낮지만 O(n·m) 완화)
-  return matchWindowedGreedy(leftSeg, rightSeg);
+    const intraMin = depth >= 1 ? INTRA_UNIQUE_SIG_MIN_NESTED : INTRA_UNIQUE_SIG_MIN_TOP;
+    const intra = buildUniqueSigPairsInSlices(leftSeg, rightSeg, intraMin);
+    if (intra.length > 0) {
+      return matchSegmentWithInternalAnchors(leftSeg, rightSeg, depth, anchorBoundary);
+    }
+
+    const hashPinned = tryMatchByNormHashPins(leftSeg, rightSeg, depth, anchorBoundary);
+    if (hashPinned) return hashPinned;
+
+    if (n * m <= SEGMENT_DP_MAX * SEGMENT_DP_MAX && n * m <= perf.hardSegmentCells) {
+      return matchSegmentDp(leftSeg, rightSeg);
+    }
+
+    const run = findLongestEqualSignatureRun(leftSeg, rightSeg);
+    if (run && depth + 1 < MAX_SEGMENT_RECURSION) {
+      const { li0, ri0, len } = run;
+      const out: AlignedPair[] = [];
+      out.push(...matchSegment(leftSeg.slice(0, li0), rightSeg.slice(0, ri0), depth + 1, anchorBoundary));
+      for (let k = 0; k < len; k += 1) {
+        out.push({ left: leftSeg[li0 + k], right: rightSeg[ri0 + k] });
+      }
+      out.push(...matchSegment(leftSeg.slice(li0 + len), rightSeg.slice(ri0 + len), depth + 1, anchorBoundary));
+      return out;
+    }
+
+    return matchWindowedGreedy(leftSeg, rightSeg);
+  });
 }
 
 /**
  * 표준 2문자열 편집 DP를 "문단 시퀀스"에 적용한 것. `dp[i][j]` = 왼쪽 i개·오른쪽 j개까지 최소 비용.
  * - 치환 비용은 `matchCost`(0~수렴)이고 삽입/삭제는 고정 `del`/`ins`(1.05)로 스무딩한다.
  * - 백트래킹 동률 시 `match > delete > insert` 순으로 분기해, 삽입으로만 밀린 것처럼 보이는 경향을 줄인다.
+ * - 연속한 `matchCost===0`(시그니처 일치 등) 대각선은 한 번에 소비(snake)해 백트래킹 루프 비용을 줄인다.
  */
 function matchSegmentDp(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSnapshot[]): AlignedPair[] {
   if (shouldBailToGreedy()) return matchWindowedGreedy(leftSeg, rightSeg);
@@ -1403,6 +1833,20 @@ function matchSegmentDp(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSna
       out.push({ left: leftSeg[i - 1], right: rightSeg[j - 1] });
       i -= 1;
       j -= 1;
+      // Snake: 이후 `matchCost===0`이고 대각선이 최적을 유지하는 동안 연속 소비.
+      while (i > 0 && j > 0) {
+        const lp = leftSeg[i - 1];
+        const rp = rightSeg[j - 1];
+        if (matchCost(lp, rp) !== 0) break;
+        if (Math.abs(dp[i][j] - dp[i - 1][j - 1]) >= eps) break;
+        const delC = dp[i - 1][j] + del;
+        const insC = dp[i][j - 1] + ins;
+        if (delC < dp[i][j] - eps || insC < dp[i][j] - eps) break;
+        out.push({ left: lp, right: rp });
+        i -= 1;
+        j -= 1;
+      }
+      continue;
     } else if (i > 0 && Math.abs(candDel - target) < eps) {
       out.push({ left: leftSeg[i - 1], right: null });
       i -= 1;
@@ -1610,27 +2054,247 @@ function shouldMergeRemovedAddedAsModify(lp: CompareParaSnapshot, rp: ComparePar
   return textSimilarity(lp.normalizedText, rp.normalizedText) >= REMOVED_ADDED_MERGE_SIM_MIN;
 }
 
-// ─── alignment 본문: 앵커 → 구간 정렬 → AlignedPair 스트림 후처리 ─────────────
+// ─── alignment 본문: 앵커 → 구간 정렬 → 단계 스트림 → cleanup ─────────────────
 
 /**
- * 문서 대 문서(alignment) 텍스트 diff.
- *
- * (1) **앵커·구간 정렬** — `buildAnchorPairs`로 글로벌 뼈대를 잡고, 앵커 사이마다 `matchSegment`로
- *     `AlignedPair[]`를 이어 붙인다. 여기까지가 "어느 문단과 어느 문단이 같은 줄인가"의 기계적 답.
- * (2) **스트림 후처리** — 아래 for는 반드시 앞에서부터 순회한다. `i += 1`로 두 칸을 한 번에
- *     소비하는 분기(빈 문단 승격·삭제+추가 병합·분할 재라벨)가 있어 순서가 결과에 직접 영향을 준다.
- *     - `shouldPromoteEmptyTextEdit`: DP가 (삭제)(추가)로 쪼갠 빈↔비빈 문단을 modified 한 건으로 승격.
- *     - `shouldMergeRemovedAddedAsModify`: (L,null)(null,R) 등을 유사도·거리로 수정 한 건으로 승격.
- *     - `isLeftParagraphSplitIntoTwoRightParas`: (null,R앞)(L,R뒤) 순서를 사용자 기대(변경+추가)로 교정.
- *     - 단일 null 반대편 → added / removed; (L,R) 양쪽 존재 → 텍스트·이동·컨트롤 수 메타.
- * (3) **한계** — 정렬 단계에서 이미 엇갈린 매칭은 이 함수만으로 완전 복구되지 않는다. 앵커/튜닝·로그 ③을 함께 본다.
+ * `AlignedPair`를 한 칸씩 전진하는 스트림으로 바꾼다(DMP cleanup 전 단계).
+ * lookahead 없이 `cleanupParagraphAlignStepsToDiffItems`에서만 2칸 패턴을 처리한다.
  */
-function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSnapshot): DiffItem[] {
+type ParagraphAlignStep =
+  | { kind: 'lr'; l: CompareParaSnapshot; r: CompareParaSnapshot }
+  | { kind: 'l'; l: CompareParaSnapshot }
+  | { kind: 'r'; r: CompareParaSnapshot };
+
+function buildParagraphAlignStepsFromAligned(aligned: AlignedPair[]): ParagraphAlignStep[] {
+  const steps: ParagraphAlignStep[] = [];
+  for (const pair of aligned) {
+    const { left: l, right: r } = pair;
+    if (!l && !r) continue;
+    if (l && !r) steps.push({ kind: 'l', l });
+    else if (!l && r) steps.push({ kind: 'r', r });
+    else steps.push({ kind: 'lr', l: l!, r: r! });
+  }
+  return steps;
+}
+
+/**
+ * 정렬 스트림을 `DiffItem[]`로 바꾼다. DMP `diff_cleanupSemantic`과 같이
+ * “기계적 변환 + 고정 순서 cleanup”을 한곳에 모은다.
+ */
+function cleanupParagraphAlignStepsToDiffItems(
+  steps: ParagraphAlignStep[],
+  lps: CompareParaSnapshot[],
+  rps: CompareParaSnapshot[],
+): DiffItem[] {
   const diffs: DiffItem[] = [];
+  let i = 0;
+  while (i < steps.length) {
+    const s0 = steps[i];
+    const s1 = i + 1 < steps.length ? steps[i + 1] : null;
+
+    if (s0.kind === 'l' && s1?.kind === 'r' && shouldPromoteEmptyTextEdit(s0.l, s1.r, lps, rps)) {
+      diffs.push({
+        id: mkDiffId('text', `modified-empty-edit:${s0.l.section}:${s0.l.paragraph}`),
+        kind: 'text',
+        severity: 'modified',
+        path: preferRightPath(s0.l, s1.r),
+        title: `텍스트 변경 (${s0.l.section}.${s0.l.paragraph})`,
+        leftPreview: s0.l.text,
+        rightPreview: s1.r.text,
+        leftAnchor: s0.l.anchor,
+        rightAnchor: s1.r.anchor,
+      });
+      i += 2;
+      continue;
+    }
+    if (s0.kind === 'r' && s1?.kind === 'l' && shouldPromoteEmptyTextEdit(s1.l, s0.r, lps, rps)) {
+      diffs.push({
+        id: mkDiffId('text', `modified-empty-edit:${s1.l.section}:${s1.l.paragraph}`),
+        kind: 'text',
+        severity: 'modified',
+        path: preferRightPath(s1.l, s0.r),
+        title: `텍스트 변경 (${s1.l.section}.${s1.l.paragraph})`,
+        leftPreview: s1.l.text,
+        rightPreview: s0.r.text,
+        leftAnchor: s1.l.anchor,
+        rightAnchor: s0.r.anchor,
+      });
+      i += 2;
+      continue;
+    }
+
+    if (s0.kind === 'l' && s1?.kind === 'r' && shouldMergeRemovedAddedAsModify(s0.l, s1.r)) {
+      const r2 = s1.r;
+      diffs.push({
+        id: mkDiffId('text', `modified-merged:${s0.l.section}:${s0.l.paragraph}`),
+        kind: 'text',
+        severity: 'modified',
+        path: preferRightPath(s0.l, r2),
+        title: `텍스트 변경 (${r2.section}.${r2.paragraph})`,
+        leftPreview: s0.l.text,
+        rightPreview: r2.text,
+        leftAnchor: s0.l.anchor,
+        rightAnchor: r2.anchor,
+        leftSectionPage: s0.l.sectionPage,
+        rightSectionPage: r2.sectionPage,
+      });
+      i += 2;
+      continue;
+    }
+    if (s0.kind === 'r' && s1?.kind === 'l' && shouldMergeRemovedAddedAsModify(s1.l, s0.r)) {
+      const l2 = s1.l;
+      diffs.push({
+        id: mkDiffId('text', `modified-merged:${l2.section}:${l2.paragraph}`),
+        kind: 'text',
+        severity: 'modified',
+        path: preferRightPath(l2, s0.r),
+        title: `텍스트 변경 (${s0.r.section}.${s0.r.paragraph})`,
+        leftPreview: l2.text,
+        rightPreview: s0.r.text,
+        leftAnchor: l2.anchor,
+        rightAnchor: s0.r.anchor,
+        leftSectionPage: l2.sectionPage,
+        rightSectionPage: s0.r.sectionPage,
+      });
+      i += 2;
+      continue;
+    }
+
+    if (s0.kind === 'r' && s1?.kind === 'lr' && isLeftParagraphSplitIntoTwoRightParas(s1.l, s0.r, s1.r)) {
+      const L = s1.l;
+      const rHead = s0.r;
+      const rTail = s1.r;
+      diffs.push(
+        {
+          id: mkDiffId('text', `modified:${L.section}:${L.paragraph}`),
+          kind: 'text',
+          severity: 'modified',
+          path: preferRightPath(L, rHead),
+          title: `텍스트 변경 (${rHead.section}.${rHead.paragraph})`,
+          leftPreview: L.text,
+          rightPreview: rHead.text,
+          leftAnchor: L.anchor,
+          rightAnchor: rHead.anchor,
+          leftSectionPage: L.sectionPage,
+          rightSectionPage: rHead.sectionPage,
+        },
+        {
+          id: mkDiffId('text', `added:${rTail.section}:${rTail.paragraph}`),
+          kind: 'text',
+          severity: 'added',
+          path: { section: rTail.section, paragraph: rTail.paragraph },
+          title: `문단 추가 (${rTail.section}.${rTail.paragraph})`,
+          leftPreview: '',
+          rightPreview: rTail.text,
+          rightAnchor: rTail.anchor,
+          rightSectionPage: rTail.sectionPage,
+        },
+      );
+      i += 2;
+      continue;
+    }
+
+    if (s0.kind === 'r') {
+      const r = s0.r;
+      diffs.push({
+        id: mkDiffId('text', `added:${r.section}:${r.paragraph}`),
+        kind: 'text',
+        severity: 'added',
+        path: { section: r.section, paragraph: r.paragraph },
+        title: `문단 추가 (${r.section}.${r.paragraph})`,
+        leftPreview: '',
+        rightPreview: r.text,
+        rightAnchor: r.anchor,
+        rightSectionPage: r.sectionPage,
+      });
+      i += 1;
+      continue;
+    }
+    if (s0.kind === 'l') {
+      const l = s0.l;
+      diffs.push({
+        id: mkDiffId('text', `removed:${l.section}:${l.paragraph}`),
+        kind: 'text',
+        severity: 'removed',
+        path: preferRightPath(l, null),
+        title: `문단 삭제 (${l.section}.${l.paragraph})`,
+        leftPreview: l.text,
+        rightPreview: '',
+        leftAnchor: l.anchor,
+        leftSectionPage: l.sectionPage,
+      });
+      i += 1;
+      continue;
+    }
+
+    const l = s0.l;
+    const r = s0.r;
+    if (l.normalizedText !== r.normalizedText) {
+      diffs.push({
+        id: mkDiffId('text', `modified:${l.section}:${l.paragraph}`),
+        kind: 'text',
+        severity: 'modified',
+        path: preferRightPath(l, r),
+        title: `텍스트 변경 (${l.section}.${l.paragraph})`,
+        leftPreview: l.text,
+        rightPreview: r.text,
+        leftAnchor: l.anchor,
+        rightAnchor: r.anchor,
+      });
+    }
+
+    if (l.signature === r.signature && Math.abs(l.globalIndex - r.globalIndex) > MOVE_DISTANCE_THRESHOLD) {
+      diffs.push({
+        id: mkDiffId('paragraphMeta', `moved:${l.section}:${l.paragraph}`),
+        kind: 'paragraphMeta',
+        severity: 'modified',
+        path: { section: l.section, paragraph: l.paragraph },
+        title: `문단 이동 감지 (${l.section}.${l.paragraph})`,
+        leftPreview: `A idx=${l.globalIndex}`,
+        rightPreview: `B idx=${r.globalIndex}`,
+        leftAnchor: l.anchor,
+        rightAnchor: r.anchor,
+      });
+    }
+
+    if (l.controlCount !== r.controlCount) {
+      diffs.push({
+        id: mkDiffId('paragraphMeta', `ctrlcount:${l.section}:${l.paragraph}`),
+        kind: 'paragraphMeta',
+        severity: 'modified',
+        path: { section: l.section, paragraph: l.paragraph },
+        title: `문단 개체 수 변경 (${l.section}.${l.paragraph})`,
+        leftPreview: `controls=${l.controlCount}`,
+        rightPreview: `controls=${r.controlCount}`,
+        leftAnchor: l.anchor,
+        rightAnchor: r.anchor,
+      });
+    }
+
+    i += 1;
+  }
+  return diffs;
+}
+
+/**
+ * 문서 대 문서(alignment) 텍스트 diff + 컨트롤 매칭용 문단 맵.
+ *
+ * 1. `buildAnchorPairs`: 글로벌 앵커(단조 `ri`, 시그니처 유일, 짧은 줄은 trim 양쪽 1회).
+ * 2. 앵커 경계마다 `matchSegment(..., anchorBoundary)`로 `AlignedPair[]` 누적.
+ * 3. `buildRightToLeftParaMapFromAligned(aligned)`: 오른쪽 문단 좌표 → 짝 왼쪽 문단(양쪽 non-null만).
+ * 4. `buildParagraphAlignStepsFromAligned` → `cleanupParagraphAlignStepsToDiffItems`로 `DiffItem[]` 생성.
+ *
+ * 반환의 `rightToLeftPara`는 cleanup 이전 `aligned`와 일치한다. 컨트롤 단계는 이 맵으로
+ * 물리 `paragraph`가 달라도 같은 논리 문단의 개체를 다시 붙인다(`buildControlDiffs`).
+ */
+function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSnapshot): {
+  diffs: DiffItem[];
+  rightToLeftPara: Map<string, CompareParaSnapshot>;
+} {
   const lps = left.paragraphs;
   const rps = right.paragraphs;
   const anchorTuning = resolveAnchorTuning(activeCompareOptions ?? DEFAULT_COMPARE_OPTIONS);
-  const anchors = buildAnchorPairs(lps, rps);
+  const anchors = buildAnchorPairs(lps, rps, anchorTuning);
   if (isCompareDebugEnabled()) {
     compareDbg(
       '[③ 앵커] 시그니처 유일 + 품질필터(길이/공백비율/엔트로피). 빈 줄·패턴 문장이 많으면 구간이 어긋날 수 있음.',
@@ -1662,213 +2326,143 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
     const leftSeg = lps.slice(a.li + 1, b.li);
     const rightSeg = rps.slice(a.ri + 1, b.ri);
     if (leftSeg.length === 0 && rightSeg.length === 0) continue;
-    aligned.push(...matchSegment(leftSeg, rightSeg));
+    const anchorBoundary: SegmentAnchorBoundary | null =
+      a.li >= 0 && a.ri >= 0
+        ? { leftAnchorGi: lps[a.li].globalIndex, rightAnchorGi: rps[a.ri].globalIndex }
+        : null;
+    aligned.push(...matchSegment(leftSeg, rightSeg, 0, anchorBoundary));
   }
 
-  for (let i = 0; i < aligned.length; i += 1) {
-    const pair = aligned[i];
-    const l = pair.left;
-    const r = pair.right;
-    const next = i + 1 < aligned.length ? aligned[i + 1] : null;
+  const rightToLeftPara = buildRightToLeftParaMapFromAligned(aligned);
+  const steps = buildParagraphAlignStepsFromAligned(aligned);
+  const diffs = cleanupParagraphAlignStepsToDiffItems(steps, lps, rps);
+  return { diffs, rightToLeftPara };
+}
 
-    // 구조 기반 보정: 빈 문단 편집(빈 -> 텍스트 / 텍스트 -> 빈)
-    // DP가 (삭제+추가)로 갈라놓은 경우를 같은 문단 수정으로 재분류한다.
-    if (
-      l &&
-      !r &&
-      next &&
-      !next.left &&
-      next.right &&
-      shouldPromoteEmptyTextEdit(l, next.right, lps, rps)
-    ) {
-      diffs.push({
-        id: mkDiffId('text', `modified-empty-edit:${l.section}:${l.paragraph}`),
-        kind: 'text',
-        severity: 'modified',
-        path: preferRightPath(l, next.right),
-        title: `텍스트 변경 (${l.section}.${l.paragraph})`,
-        leftPreview: l.text,
-        rightPreview: next.right.text,
-        leftAnchor: l.anchor,
-        rightAnchor: next.right.anchor,
-      });
-      i += 1;
-      continue;
-    }
-    if (
-      !l &&
-      r &&
-      next &&
-      next.left &&
-      !next.right &&
-      shouldPromoteEmptyTextEdit(next.left, r, lps, rps)
-    ) {
-      diffs.push({
-        id: mkDiffId('text', `modified-empty-edit:${next.left.section}:${next.left.paragraph}`),
-        kind: 'text',
-        severity: 'modified',
-        path: preferRightPath(next.left, r),
-        title: `텍스트 변경 (${next.left.section}.${next.left.paragraph})`,
-        leftPreview: next.left.text,
-        rightPreview: r.text,
-        leftAnchor: next.left.anchor,
-        rightAnchor: r.anchor,
-      });
-      i += 1;
-      continue;
-    }
+/**
+ * 키가 달라진 뒤에도 **표(table)** 만 모아, 요약 문자열에서 뽑은 키(`txt` / `sig` / 해시) 기준으로
+ * 양쪽 문서에서 각각 **정확히 한 개**뿐인 표끼리 1:1 고정한다(Git Patience 유사).
+ *
+ * 문단 슬롯(`pairAlignmentSlotControls`)이 먼저 돌기 때문에, 동일 표가 이미 짝지어졌으면 여기까지 내려오지 않는다.
+ * 이 단계는 표 요약이 충분히 구별될 때만 효과가 있다.
+ */
+function extractTablePatiencePins(
+  left: CompareControlSnapshot[],
+  right: CompareControlSnapshot[],
+): { pins: ControlPair[]; restLeft: CompareControlSnapshot[]; restRight: CompareControlSnapshot[] } {
+  const pins: ControlPair[] = [];
+  const lTables = left.filter((c) => c.type === 'table');
+  const rTables = right.filter((c) => c.type === 'table');
+  if (lTables.length === 0 || rTables.length === 0) {
+    return { pins: [], restLeft: left, restRight: right };
+  }
+  const keyOf = (c: CompareControlSnapshot): string => {
+    const kv = parseSummaryKV(c.summary);
+    const t = (kv.txt ?? '').trim();
+    if (t) return `t:${t}`;
+    const sg = (kv.sig ?? '').trim();
+    if (sg) return `s:${sg}`;
+    return `h:${simpleHash(c.summary)}`;
+  };
+  const lByKey = new Map<string, CompareControlSnapshot[]>();
+  const rByKey = new Map<string, CompareControlSnapshot[]>();
+  for (const c of lTables) {
+    const k = keyOf(c);
+    const arr = lByKey.get(k);
+    if (arr) arr.push(c);
+    else lByKey.set(k, [c]);
+  }
+  for (const c of rTables) {
+    const k = keyOf(c);
+    const arr = rByKey.get(k);
+    if (arr) arr.push(c);
+    else rByKey.set(k, [c]);
+  }
+  const usedL = new Set<CompareControlSnapshot>();
+  const usedR = new Set<CompareControlSnapshot>();
+  for (const [k, ls] of lByKey) {
+    const rs = rByKey.get(k);
+    if (!rs || ls.length !== 1 || rs.length !== 1) continue;
+    pins.push({ left: ls[0], right: rs[0] });
+    usedL.add(ls[0]);
+    usedR.add(rs[0]);
+  }
+  return {
+    pins,
+    restLeft: left.filter((c) => !usedL.has(c)),
+    restRight: right.filter((c) => !usedR.has(c)),
+  };
+}
 
-    // (L,null)(null,R): 정렬은 삭제+추가지만, 밀림 등으로 isNear가 깨져도 텍스트가 같으면 수정으로 승격
-    if (l && !r && next && !next.left && next.right && shouldMergeRemovedAddedAsModify(l, next.right)) {
-      const r2 = next.right;
-      diffs.push({
-        id: mkDiffId('text', `modified-merged:${l.section}:${l.paragraph}`),
-        kind: 'text',
-        severity: 'modified',
-        path: preferRightPath(l, r2),
-        title: `텍스트 변경 (${r2.section}.${r2.paragraph})`,
-        leftPreview: l.text,
-        rightPreview: r2.text,
-        leftAnchor: l.anchor,
-        rightAnchor: r2.anchor,
-        leftSectionPage: l.sectionPage,
-        rightSectionPage: r2.sectionPage,
-      });
-      i += 1;
-      continue;
-    }
-    if (!l && r && next && next.left && !next.right && shouldMergeRemovedAddedAsModify(next.left, r)) {
-      const l2 = next.left;
-      diffs.push({
-        id: mkDiffId('text', `modified-merged:${l2.section}:${l2.paragraph}`),
-        kind: 'text',
-        severity: 'modified',
-        path: preferRightPath(l2, r),
-        title: `텍스트 변경 (${r.section}.${r.paragraph})`,
-        leftPreview: l2.text,
-        rightPreview: r.text,
-        leftAnchor: l2.anchor,
-        rightAnchor: r.anchor,
-        leftSectionPage: l2.sectionPage,
-        rightSectionPage: r.sectionPage,
-      });
-      i += 1;
-      continue;
-    }
+/**
+ * 문단 정렬 맵(`rightToLeftPara`)을 이용한 컨트롤 **슬롯** 매칭.
+ *
+ * 전제: `kind::key` 1차 매칭에서 빠진 표·도형·그림이 있다. 오른쪽 컨트롤 `r`의 부모 문단이
+ * 맵에서 왼쪽 문단 `L`로 짝지어져 있으면, 후보는 **같은 문단 좌표(`paraPosKey(L)`)에 남아 있는
+ * 왼쪽 미매칭 컨트롤**으로 한정한다. 이렇게 하면 위쪽에 표가 삽입되어 y·para 인덱스만 밀린 경우에도
+ * “테스트 7 표 vs 테스트 7 표”처럼 짝을 다시 찾을 수 있다.
+ *
+ * 알고리즘: 오른쪽을 (section, paragraph, controlIdx)순으로 정렬한 뒤, 각 `r`에 대해 버킷 내에서
+ * `scoreControlFallback` 최대 + `ALIGNMENT_CONTROL_SLOT_BONUS`가 `ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE`
+ * 이상인 쌍만 채택(탐욕, 한 왼쪽 개체는 한 번만 사용).
+ */
+function pairAlignmentSlotControls(
+  unmatchedLeft: CompareControlSnapshot[],
+  unmatchedRight: CompareControlSnapshot[],
+  rightToLeftPara: Map<string, CompareParaSnapshot>,
+): { pairs: ControlPair[]; restLeft: CompareControlSnapshot[]; restRight: CompareControlSnapshot[] } {
+  if (rightToLeftPara.size === 0) {
+    return { pairs: [], restLeft: unmatchedLeft, restRight: unmatchedRight };
+  }
+  const leftByPara = new Map<string, CompareControlSnapshot[]>();
+  for (const c of unmatchedLeft) {
+    const k = paraPosKey(c);
+    if (!leftByPara.has(k)) leftByPara.set(k, []);
+    leftByPara.get(k)!.push(c);
+  }
+  for (const arr of leftByPara.values()) {
+    arr.sort((a, b) => (extractControlIndexFromKey(a.key) ?? 0) - (extractControlIndexFromKey(b.key) ?? 0));
+  }
 
-    // 정렬이 (null, R앞)(L, R뒤)로 나오면 기본은 R앞=추가·L↔R뒤=변경 순이 되어 라벨이 뒤집힌다.
-    // 왼쪽 원문 L과 R앞+R뒤가 같으면: R앞은 기존 문단에 남은 부분→텍스트 변경, R뒤만 문단 추가.
-    if (!l && r && next && next.left && next.right && isLeftParagraphSplitIntoTwoRightParas(next.left, r, next.right)) {
-      const L = next.left;
-      const rHead = r;
-      const rTail = next.right;
-      diffs.push(
-        {
-          id: mkDiffId('text', `modified:${L.section}:${L.paragraph}`),
-          kind: 'text',
-          severity: 'modified',
-          path: preferRightPath(L, rHead),
-          title: `텍스트 변경 (${rHead.section}.${rHead.paragraph})`,
-          leftPreview: L.text,
-          rightPreview: rHead.text,
-          leftAnchor: L.anchor,
-          rightAnchor: rHead.anchor,
-          leftSectionPage: L.sectionPage,
-          rightSectionPage: rHead.sectionPage,
-        },
-        {
-          id: mkDiffId('text', `added:${rTail.section}:${rTail.paragraph}`),
-          kind: 'text',
-          severity: 'added',
-          path: { section: rTail.section, paragraph: rTail.paragraph },
-          title: `문단 추가 (${rTail.section}.${rTail.paragraph})`,
-          leftPreview: '',
-          rightPreview: rTail.text,
-          rightAnchor: rTail.anchor,
-          rightSectionPage: rTail.sectionPage,
-        },
-      );
-      i += 1;
-      continue;
-    }
+  const sortedR = [...unmatchedRight].sort((a, b) => {
+    if (a.section !== b.section) return a.section - b.section;
+    if (a.paragraph !== b.paragraph) return a.paragraph - b.paragraph;
+    return (extractControlIndexFromKey(a.key) ?? 0) - (extractControlIndexFromKey(b.key) ?? 0);
+  });
 
-    if (!l && r) {
-      diffs.push({
-        id: mkDiffId('text', `added:${r.section}:${r.paragraph}`),
-        kind: 'text',
-        severity: 'added',
-        path: { section: r.section, paragraph: r.paragraph },
-        title: `문단 추가 (${r.section}.${r.paragraph})`,
-        leftPreview: '',
-        rightPreview: r.text,
-        rightAnchor: r.anchor,
-        rightSectionPage: r.sectionPage,
-      });
-      continue;
-    }
-    if (l && !r) {
-      diffs.push({
-        id: mkDiffId('text', `removed:${l.section}:${l.paragraph}`),
-        kind: 'text',
-        severity: 'removed',
-        path: preferRightPath(l, r),
-        title: `문단 삭제 (${l.section}.${l.paragraph})`,
-        leftPreview: l.text,
-        rightPreview: '',
-        leftAnchor: l.anchor,
-        leftSectionPage: l.sectionPage,
-      });
-      continue;
-    }
-    if (!l || !r) continue;
+  const usedL = new Set<CompareControlSnapshot>();
+  const usedR = new Set<CompareControlSnapshot>();
+  const pairs: ControlPair[] = [];
 
-    if (l.normalizedText !== r.normalizedText) {
-      diffs.push({
-        id: mkDiffId('text', `modified:${l.section}:${l.paragraph}`),
-        kind: 'text',
-        severity: 'modified',
-        path: preferRightPath(l, r),
-        title: `텍스트 변경 (${l.section}.${l.paragraph})`,
-        leftPreview: l.text,
-        rightPreview: r.text,
-        leftAnchor: l.anchor,
-        rightAnchor: r.anchor,
-      });
+  for (const r of sortedR) {
+    const lp = rightToLeftPara.get(paraPosKey(r));
+    if (!lp) continue;
+    const bucket = leftByPara.get(paraPosKey(lp));
+    if (!bucket?.length) continue;
+    let best: CompareControlSnapshot | null = null;
+    let bestAdj = -1;
+    for (const l of bucket) {
+      if (usedL.has(l)) continue;
+      const raw = scoreControlFallback(l, r);
+      if (raw < 0) continue;
+      const adj = raw + ALIGNMENT_CONTROL_SLOT_BONUS;
+      if (adj > bestAdj) {
+        bestAdj = adj;
+        best = l;
+      }
     }
-
-    // 이동 감지: 텍스트/서명은 같지만 위치가 크게 달라진 경우
-    if (
-      l.signature === r.signature &&
-      Math.abs(l.globalIndex - r.globalIndex) > MOVE_DISTANCE_THRESHOLD
-    ) {
-      diffs.push({
-        id: mkDiffId('paragraphMeta', `moved:${l.section}:${l.paragraph}`),
-        kind: 'paragraphMeta',
-        severity: 'modified',
-        path: { section: l.section, paragraph: l.paragraph },
-        title: `문단 이동 감지 (${l.section}.${l.paragraph})`,
-        leftPreview: `A idx=${l.globalIndex}`,
-        rightPreview: `B idx=${r.globalIndex}`,
-        leftAnchor: l.anchor,
-        rightAnchor: r.anchor,
-      });
-    }
-
-    if (l.controlCount !== r.controlCount) {
-      diffs.push({
-        id: mkDiffId('paragraphMeta', `ctrlcount:${l.section}:${l.paragraph}`),
-        kind: 'paragraphMeta',
-        severity: 'modified',
-        path: { section: l.section, paragraph: l.paragraph },
-        title: `문단 개체 수 변경 (${l.section}.${l.paragraph})`,
-        leftPreview: `controls=${l.controlCount}`,
-        rightPreview: `controls=${r.controlCount}`,
-        leftAnchor: l.anchor,
-        rightAnchor: r.anchor,
-      });
+    if (best && bestAdj >= ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE) {
+      usedL.add(best);
+      usedR.add(r);
+      pairs.push({ left: best, right: r });
     }
   }
-  return diffs;
+
+  return {
+    pairs,
+    restLeft: unmatchedLeft.filter((c) => !usedL.has(c)),
+    restRight: unmatchedRight.filter((c) => !usedR.has(c)),
+  };
 }
 
 /** compareSnapshots 등에서 options 일부가 빠졌을 때의 기본값. kinds는 UI 노이즈를 줄이기 위해 화이트리스트 형태 */
@@ -1881,13 +2475,26 @@ const DEFAULT_COMPARE_OPTIONS: CompareOptions = {
 /** compareSnapshots 실행 중 `matchCost`/`resolveAnchorTuning` 등이 읽는 전역(스레드 안전은 요구하지 않음) */
 let activeCompareOptions: CompareOptions | null = null;
 
-// ─── 컨트롤 diff: 키 정확 매칭 → 폴백 → added/removed ─────────────────────────
+// ─── 컨트롤 diff: 키 매칭 → 정렬 슬롯 → 표 patience 핀 → 폴백 → added/removed ───
 
 /**
- * 표/그림 등 컨트롤: kind+key로 1차 매칭 → 남은 것은 위치·요약 유사도로 폴백 매칭.
- * 폴백에서 내용이 동일하면(diff-engine 상단 정책) 사용자 혼동을 줄이기 위해 항목 생략 가능.
+ * 표·도형·그림 등 컨트롤 diff. 단계:
+ *
+ * 1. **키 정확 매칭** — `kind::key`(우선 `sid:paraStableId:ci:type`). 좌우 동시 존재하면 내용 비교 후
+ *    `buildGranularControlDiffs` 또는 동일 시 생략. 한쪽만 있으면 unmatched 버퍼.
+ * 2. **정렬 슬롯**(`rightToLeftPara`가 비어 있지 않을 때) — `pairAlignmentSlotControls`.
+ *    짝이 맞고 요약·종류까지 같으면 diff 생략(순수 밀림), 다르면 `align-slot:` 스템으로 상세 diff.
+ * 3. **표 Patience** — `extractTablePatiencePins`(요약에서 뽑은 키가 양쪽 유일할 때).
+ * 4. **전역 폴백** — `pairControlsFallback`(임계 2.75). 동일 요약·타입이면 생략.
+ * 5. 남은 항목은 added / removed.
+ *
+ * `identity` 전략에서는 맵이 비어 2단계가 no-op이 된다.
  */
-function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSnapshot): DiffItem[] {
+function buildControlDiffs(
+  left: CompareDocumentSnapshot,
+  right: CompareDocumentSnapshot,
+  rightToLeftPara?: Map<string, CompareParaSnapshot>,
+): DiffItem[] {
   const diffs: DiffItem[] = [];
   const lmap = new Map(left.controls.map((c) => [`${c.kind}::${c.key}`, c] as const));
   const rmap = new Map(right.controls.map((c) => [`${c.kind}::${c.key}`, c] as const));
@@ -1909,8 +2516,28 @@ function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocument
     if (r) unmatchedRight.push(r);
   }
 
+  let slotRestL = unmatchedLeft;
+  let slotRestR = unmatchedRight;
+  if (rightToLeftPara && rightToLeftPara.size > 0) {
+    const slot = pairAlignmentSlotControls(unmatchedLeft, unmatchedRight, rightToLeftPara);
+    for (const { left: l, right: r } of slot.pairs) {
+      if (l.summary !== r.summary || l.kind !== r.kind) {
+        diffs.push(...buildGranularControlDiffs(l, r, `align-slot:${l.key}=>${r.key}`));
+      }
+    }
+    slotRestL = slot.restLeft;
+    slotRestR = slot.restRight;
+  }
+
+  const { pins, restLeft, restRight } = extractTablePatiencePins(slotRestL, slotRestR);
+  for (const { left: l, right: r } of pins) {
+    if (l.summary !== r.summary || l.kind !== r.kind) {
+      diffs.push(...buildGranularControlDiffs(l, r, `table-pin:${l.key}=>${r.key}`));
+    }
+  }
+
   // 2차: key가 달라진 컨트롤(특히 표/이미지)의 폴백 매칭
-  const fallbackPairs = pairControlsFallback(unmatchedLeft, unmatchedRight);
+  const fallbackPairs = pairControlsFallback(restLeft, restRight);
   const pairedL = new Set(fallbackPairs.map((p) => p.left));
   const pairedR = new Set(fallbackPairs.map((p) => p.right));
   for (const { left: l, right: r } of fallbackPairs) {
@@ -1919,7 +2546,7 @@ function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocument
     diffs.push(...buildGranularControlDiffs(l, r, `fallback-modified:${l.key}=>${r.key}`));
   }
 
-  for (const r of unmatchedRight) {
+  for (const r of restRight) {
     if (pairedR.has(r)) continue;
     const key = `${r.kind}::${r.key}`;
     diffs.push({
@@ -1933,7 +2560,7 @@ function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocument
       rightAnchor: r.anchor,
     });
   }
-  for (const l of unmatchedLeft) {
+  for (const l of restLeft) {
     if (pairedL.has(l)) continue;
     const key = `${l.kind}::${l.key}`;
     diffs.push({
@@ -1951,8 +2578,10 @@ function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocument
 }
 
 /**
- * key가 어긋난 좌/우 컨트롤을 탐욕적으로 짝지음. 오른쪽 하나당 왼쪽에서 최고 `scoreControlFallback`을 고른다.
- * `bestScore >= 2.75` 미만이면 매칭하지 않아 오매칭 added/removed를 줄인다(표/그림 위치 휴리스틱).
+ * 키·슬롯·표 핀 이후에도 남은 좌·우 컨트롤을 **전역 탐욕**으로 짝지음(오른쪽 각각에 대해 왼쪽 후보 중 최고점).
+ *
+ * `bestScore >= 2.75` 미만이면 매칭하지 않는다 — 절대 좌표·요약 유사도만으로 오매칭하면 added/removed 노이즈가 커지기 때문.
+ * 문단 정렬이 신뢰되는 경우에는 먼저 `pairAlignmentSlotControls`가 같은 논리 문단 안에서 점수 보너스를 준다.
  */
 function pairControlsFallback(
   left: CompareControlSnapshot[],
@@ -1982,8 +2611,14 @@ function pairControlsFallback(
 }
 
 /**
- * 폴백 매칭 점수: 종류·요약 일치에 큰 가중, 섹션/페이지/좌표 근접·control index 일치에 소수 가중.
- * 음수는 불가능 쌍(kind 불일치). 임계 2.75와 함께 튜닝한다.
+ * `pairControlsFallback` / `pairAlignmentSlotControls` 공통 점수 함수.
+ *
+ * - kind 불일치 → -1 (즉시 탈락).
+ * - 동일 `type`, 동일 `summary`에 큰 가중(표·도형은 요약 문자열에 구조·텍스트 요약이 들어 있음).
+ * - 그다음 `sid`/`loc` 키에서 뽑은 **control index** 일치, 같은 section, 페이지 간격, 앵커 박스 x/y/wh 근접.
+ *
+ * 문단 삽입으로 y가 크게 밀리면 위치 항만으로는 2.75에 못 미칠 수 있어, alignment 맵이 있을 때는
+ * 슬롯 단계에서 보너스를 더해 같은 문제를 완화한다.
  */
 function scoreControlFallback(l: CompareControlSnapshot, r: CompareControlSnapshot): number {
   if (l.kind !== r.kind) return -1;
@@ -2090,9 +2725,14 @@ function annotateDiffSectionPages(
 /**
  * 이미 파싱된 스냅샷 두 개를 비교해 `CompareSession`을 만든다.
  *
- * 파이프라인: (전략 결정: identity 가능 시 sid 1:1, 아니면 alignment) → 본문 diff → 컨트롤 diff 병합
- * → `kinds` 필터 → `suppressPureReflowMoves` → `annotateDiffSectionPages` → 구역·문단 정렬.
- * 성능: `activeRuntimeGuard`로 wall-clock 상한을 두고, 초과 시 alignment 내부가 그리디 위주로 동작할 수 있다.
+ * 흐름:
+ * - `resolveTextCompareStrategy`: 공유 stable_id가 신뢰되면 `identity`, 아니면 `alignment`.
+ * - **본문**: `buildIdentityTextDiffs` 또는 `buildTextDiffs`(후자는 `{ diffs, rightToLeftPara }`).
+ * - **컨트롤**: `buildControlDiffs(left, right, rightToLeftPara)` — 문단 밀림 보정을 위해 alignment 맵 전달.
+ * - **후처리**: `options.kinds` 필터 → `suppressPureReflowMoves` → `annotateDiffSectionPages` →
+ *   구역·문단 순 정렬.
+ *
+ * 성능: `activeRuntimeGuard`로 wall-clock 상한. 초과 시 `matchSegment` 쪽이 그리디 위주로 이탈할 수 있다.
  */
 export function compareSnapshots(
   left: CompareDocumentSnapshot,
@@ -2144,18 +2784,19 @@ export function compareSnapshots(
       path:
         textMode === 'identity'
           ? 'buildIdentityTextDiffs (Map<stableId>, 인덱스 1:1 아님)'
-          : 'buildTextDiffs (앵커 + 구간 DP/Myers — ③ 로그 참고)',
+          : 'buildTextDiffs (앵커 + 구간 DP/그리디 — ③ 로그 참고)',
     });
   }
 
   // 1) 본문: identity면 sid 집합 비교, 아니면 앵커+구간 정렬
-  const textDiffs =
+  const textBundle =
     textMode === 'identity'
-      ? buildIdentityTextDiffs(left, right, options.kinds)
+      ? { diffs: buildIdentityTextDiffs(left, right, options.kinds), rightToLeftPara: new Map<string, CompareParaSnapshot>() }
       : buildTextDiffs(left, right);
+  const textDiffs = textBundle.diffs;
 
-  // 2) 개체(표/도형 등) 병합
-  const all = [...textDiffs, ...buildControlDiffs(left, right)];
+  // 2) 개체(표/도형 등) 병합 — 문단 정렬 맵으로 밀린 문단 좌표의 표·그림을 같은 슬롯에서 재짝짓기
+  const all = [...textDiffs, ...buildControlDiffs(left, right, textBundle.rightToLeftPara)];
 
   // 3) kinds 필터 + 순수 리플로우 이동 노이즈 제거 후, UI용 쪽번호 주석
   const filtered = suppressPureReflowMoves(

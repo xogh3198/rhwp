@@ -115,6 +115,28 @@ export const REGISTERED_FONTS = new Set(FONT_LIST.map(f => f.name));
 /** 초기 렌더링에 필수인 폰트 (대부분의 HWP 문서 기본 서체) */
 const CRITICAL_FONTS = new Set(['함초롬바탕', '함초롬돋움']);
 
+/** `loadWebFonts` 반환 — `main.ts` 초기화 메시지·경고용 */
+export interface FontLoadReport {
+  loaded: number;
+  failed: number;
+  total: number;
+  missingCriticalFonts: string[];
+}
+
+function missingCriticalAfterLoad(targetSet: Set<string>): string[] {
+  const out: string[] = [];
+  for (const name of CRITICAL_FONTS) {
+    if (!targetSet.has(name)) continue;
+    if (detectedOSFonts.has(name)) continue;
+    try {
+      if (!document.fonts.check(`16px "${name}"`)) out.push(name);
+    } catch {
+      out.push(name);
+    }
+  }
+  return out;
+}
+
 /** CSS @font-face 등록 여부 (중복 등록 방지) */
 let fontFaceRegistered = false;
 
@@ -166,7 +188,7 @@ export function getDetectedOSFonts(): ReadonlySet<string> {
 export async function loadWebFonts(
   docFonts?: string[],
   onProgress?: (loaded: number, total: number) => void,
-): Promise<void> {
+): Promise<FontLoadReport> {
   // 0) OS 폰트 감지 (@font-face 등록 전에 실행해야 정확)
   if (!fontFaceRegistered) {
     detectOSFonts();
@@ -204,7 +226,14 @@ export async function loadWebFonts(
     }
   }
 
-  if (uniqueToLoad.length === 0) return;
+  if (uniqueToLoad.length === 0) {
+    return {
+      loaded: 0,
+      failed: 0,
+      total: 0,
+      missingCriticalFonts: missingCriticalAfterLoad(targetSet),
+    };
+  }
 
   const total = uniqueToLoad.length;
   console.log(`[FontLoader] 웹폰트 로드 시작: ${total}개 woff2 (이미 로드됨: ${loadedFiles.size}개)`);
@@ -247,4 +276,11 @@ export async function loadWebFonts(
   }
 
   console.log(`[FontLoader] 폰트 로드 완료: ${loaded}개 성공, ${failed}개 실패 (총 ${loadedFiles.size}개 woff2 로드됨)`);
+
+  return {
+    loaded,
+    failed,
+    total,
+    missingCriticalFonts: missingCriticalAfterLoad(targetSet),
+  };
 }

@@ -64,6 +64,12 @@
  * - 비교 품질 이슈를 수정할 때는 `compareSnapshots` 진입 전후 로그(①②③)를 함께 확인해야 한다.
  * - 아키텍처 설명·발표 시에는 위 단계(앵커→정렬→문자)로 브라우저 비용을 어떻게 막는지
  *   시각적으로 보여주는 것이 효과적이다.
+ *
+ * [본 파일 구획]
+ * 아래부터 논리 블록마다 `// ─── …` 주석으로 섹션을 나눴다. 점프 검색(`───`)으로 이동하면 된다.
+ * 순서: 튜닝 상수 → 런타임 가드 → 유틸(정규화/해시) → 컨트롤 키·표 요약 → 스냅샷 수집 →
+ * stable_id·identity → 전략·reflow 필터 → alignment(DP/그리디) → 본문 diff 후처리 →
+ * 컨트롤 diff·쪽번호 주석 → `compareSnapshots` 진입점.
  */
 import { WasmBridge } from '@/core/wasm-bridge';
 import type { DocumentInfo } from '@/core/types';
@@ -81,6 +87,9 @@ import type {
   DiffItem,
   DiffKind,
 } from './types';
+
+// ═══ 튜닝·런타임 가드 ═══════════════════════════════════════════════════════
+// alignment 비용/품질은 이 상수들에 강하게 묶여 있다. README §9·파일 상단 설계 주석과 같이 볼 것.
 
 // ─── 튜닝 상수 (값 변경 시 대표 문서로 회귀 확인 권장) ─────────────────
 // 상호 의존: NEAR_STRUCTURE_* 는 isNearStructure 가 true 일 때만 전부 켜짐.
@@ -127,6 +136,7 @@ const HARD_SEGMENT_CELL_LIMIT = 180_000;
 /** 브라우저 프리징 방지: alignment 타임버짓 기본값(ms) */
 const ALIGNMENT_MAX_COMPUTE_MS = 2600;
 
+/** `compareSnapshots` 한 번 호출 동안만 유효. `ALIGNMENT_MAX_COMPUTE_MS` 경과 시 greedy 쪽으로 이탈한다. */
 type CompareRuntimeGuard = {
   deadline: number;
   bailedOut: boolean;
@@ -134,6 +144,7 @@ type CompareRuntimeGuard = {
 
 let activeRuntimeGuard: CompareRuntimeGuard | null = null;
 
+/** `CompareOptions.anchorTuning`이 있으면 그걸 쓰고, 없으면 파일 상단 기본 앵커 가드레일을 쓴다. */
 function resolveAnchorTuning(options: CompareOptions): Required<CompareAnchorTuning> {
   return {
     minTextLen: options.anchorTuning?.minTextLen ?? ANCHOR_MIN_TEXT_LEN,
@@ -143,6 +154,7 @@ function resolveAnchorTuning(options: CompareOptions): Required<CompareAnchorTun
   };
 }
 
+/** `hardSegmentCells` / `maxComputeMs` — 큰 문서에서 DP 테이블·이중 루프가 메인 스레드를 막지 않게 상한을 둔다. */
 function resolvePerformanceTuning(options: CompareOptions): Required<ComparePerformanceTuning> {
   return {
     maxComputeMs: options.performanceTuning?.maxComputeMs ?? ALIGNMENT_MAX_COMPUTE_MS,
@@ -162,6 +174,11 @@ function shannonEntropy(text: string): number {
   return entropy;
 }
 
+/**
+ * 앵커 후보 문단의 "텍스트 품질" 검사.
+ * 짧은 문장·공백만 많은 문단·문자 종류가 거의 없는 문단은 반복 제목/장식에 가까워
+ * 글로벌 앵커로 잡히면 뒤따르는 구간 전체 정렬이 한꺼번에 밀릴 수 있어 제외한다.
+ */
 function isAnchorTextQualityOk(text: string, tuning: Required<CompareAnchorTuning>): boolean {
   if (text.length < tuning.minTextLen) return false;
   const whitespaceCount = (text.match(/\s/g) ?? []).length;
@@ -170,6 +187,10 @@ function isAnchorTextQualityOk(text: string, tuning: Required<CompareAnchorTunin
   return shannonEntropy(text) >= tuning.minEntropy;
 }
 
+/**
+ * alignment 중 시간이 `maxComputeMs`를 넘기면 true로 고정되며, 이후 DP 진입을 막고 그리디로만 처리한다.
+ * DP 이중 루프 안에서는 `i % 12` 등으로 가끔만 호출해 오버헤드를 제한한다.
+ */
 function shouldBailToGreedy(): boolean {
   if (!activeRuntimeGuard) return false;
   if (activeRuntimeGuard.bailedOut) return true;
@@ -178,7 +199,10 @@ function shouldBailToGreedy(): boolean {
   return true;
 }
 
-/** 동일 stable_id 문단의 문자 단위 편집 거리·간단 패턴 요약 (2-depth diff) */
+/**
+ * 동일 stable_id 문단의 문자 단위 편집 거리·간단 패턴 요약 (2-depth diff).
+ * Levenshtein 전체 테이블을 돌리므로 `MYERS_MAX`로 한 변 길이를 제한한다(초과 시 요약 생략 문자열).
+ */
 function myersCharDiffSummary(left: string, right: string): string {
   const n = left.length;
   const m = right.length;
@@ -228,12 +252,15 @@ function myersCharDiffSummary(left: string, right: string): string {
   return `편집거리 ${dp[n][m]} · ${pat}`;
 }
 
-/** 비교 옵션에 따른 문단 텍스트 정규화(공백 무시·대소문자) */
+// ─── 정규화·해시·Diff ID (문단 시그니처·컨트롤 요약에 공통 사용) ───────────────
+
+/** 비교 옵션에 따른 문단 텍스트 정규화. `ignoreWhitespace`/`caseSensitive`는 여기서만 일괄 적용된다. */
 function normalizeText(text: string, options: CompareOptions): string {
   const base = options.ignoreWhitespace ? text.replace(/\s+/g, ' ').trim() : text;
   return options.caseSensitive ? base : base.toLowerCase();
 }
 
+/** 짧은 FNV-1a digest — 문단 시그니처·표 텍스트 digest 등 충돌 가능성은 있으나 비교용으론 충분 */
 function simpleHash(input: string): string {
   let h = 2166136261;
   for (let i = 0; i < input.length; i += 1) {
@@ -243,6 +270,7 @@ function simpleHash(input: string): string {
   return (h >>> 0).toString(16);
 }
 
+/** 바이너리(이미지 픽셀 등)용 FNV-1a 계열 해시 — 짧은 digest 문자열로 요약 비교에 사용 */
 function simpleHashBytes(bytes: Uint8Array): string {
   let h = 2166136261;
   for (let i = 0; i < bytes.length; i += 1) {
@@ -252,11 +280,15 @@ function simpleHashBytes(bytes: Uint8Array): string {
   return (h >>> 0).toString(16);
 }
 
-/** DiffItem.id — kind와 고유 키를 합쳐 UI/로그에서 항목을 식별 */
+/** DiffItem.id — kind와 고유 키를 합쳐 UI 목록·로그·reflow 필터(`id-moved:` 등)에서 항목을 식별 */
 function mkDiffId(kind: DiffKind, key: string): string {
   return `${kind}:${key}`;
 }
 
+/**
+ * WASM `item.type` + 요약 문자열을 DiffKind로 정규화.
+ * chart는 summary 키워드로 shape/group과 구분한다(도형 안 차트 등).
+ */
 function mapControlKind(type: string, summary: string): DiffKind {
   if (type === 'table') return 'table';
   if (type === 'image') return 'image';
@@ -268,6 +300,11 @@ function mapControlKind(type: string, summary: string): DiffKind {
   return 'paragraphMeta';
 }
 
+/**
+ * 동일 실개체가 `group`↔`shape`처럼 타입만 바뀌며 중복 수집되는 경우를 한 키로 묶는다.
+ * 매칭/중복 제거(`uniqueControls`)의 기준이 되므로 stem(`sid:…` 또는 `loc:…`) 추출 규칙을 바꿀 때는
+ * 레이아웃 경로·문단 직접 경로 양쪽의 key 포맷을 함께 점검해야 한다.
+ */
 function canonicalControlKey(c: CompareControlSnapshot): string {
   const m = c.key.match(/^(sid:[^:]+:\d+|loc:-?\d+:-?\d+:\d+):[^:]+$/);
   if (!m) return `${c.kind}::${c.key}`;
@@ -280,6 +317,7 @@ function canonicalControlKey(c: CompareControlSnapshot): string {
   return `${c.kind}::${stem}:image`;
 }
 
+/** 동일 canonical 키로 여러 스냅샷이 들어왔을 때, UI에 더 유의미한 요약을 남기기 위한 휴리스틱 점수 */
 function controlSnapshotQuality(c: CompareControlSnapshot): number {
   let score = 0;
   // 요소별 변경 추적 품질 점수:
@@ -292,6 +330,7 @@ function controlSnapshotQuality(c: CompareControlSnapshot): number {
   return score;
 }
 
+/** DiffKind → 짧은 한글 제목(컨트롤 추가/삭제 카드 등). UI `kindLabel`과 문구를 맞출 때 동기화 */
 function kindLabel(kind: DiffKind): string {
   if (kind === 'table') return '표';
   if (kind === 'shape') return '도형';
@@ -388,12 +427,16 @@ function buildTableSummary(
   return `table r=${dim.rowCount} c=${dim.colCount} tprev="${textPreview || '(없음)'}" cprev="${cellPreview || '(없음)'}" csha="${cellHash || '(없음)'}" txt=${textDigest} props=${propsDigest} box=${bboxDigest} sig=${sigDigest}`;
 }
 
+// ─── 표 요약 파싱·셀 단위 변경 집계 (buildGranularControlDiffs에서 사용) ───────
+
+/** `sid:…:ci:type` / `loc:…:ci:type` 형태에서 컨트롤 인덱스 `ci`만 뽑아 폴백 점수에 사용 */
 function extractControlIndexFromKey(key: string): number | null {
   const m = key.match(/:(\d+):[^:]+$/);
   if (!m) return null;
   return Number.isFinite(Number(m[1])) ? Number(m[1]) : null;
 }
 
+/** `buildTableSummary` 등이 만든 `key=value` 나열을 Record로 파싱. 값에 따옴표가 있으면 제거한다. */
 function parseSummaryKV(summary: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const m of summary.matchAll(/([a-z]+)=("([^"]*)"|[^\s]+)/g)) {
@@ -403,6 +446,10 @@ function parseSummaryKV(summary: string): Record<string, string> {
   return out;
 }
 
+/**
+ * `csha="r1c1=…&r2c2=…"` 형태(셀별 해시)를 키 단위로 비교해 변경된 셀 개수를 센다.
+ * 행/열 구조가 바뀌어 키 집합이 달라져도 union 키 기준으로 added/removed 셀을 모두 잡는다.
+ */
 function countChangedCellsByHash(leftHash: string, rightHash: string): number {
   const parse = (v: string): Map<string, string> => {
     const out = new Map<string, string>();
@@ -426,6 +473,12 @@ function countChangedCellsByHash(leftHash: string, rightHash: string): number {
   return changed;
 }
 
+/**
+ * 동일 컨트롤 쌍(l,r)에 대해 가능한 한 잘게 쪼갠 DiffItem[]을 만든다.
+ * - 표: 행/열·크기·셀 텍스트(cprev/csha)·속성(props)을 분리해 카드가 비지 않게 한다.
+ * - 이미지/도형: 크기·텍스트·자르기·효과 등 필드별 push.
+ * - `push` 내부에서 좌우 문자열이 같으면(강제 제외 아닌 이상) 항목을 생략한다.
+ */
 function buildGranularControlDiffs(
   l: CompareControlSnapshot,
   r: CompareControlSnapshot,
@@ -496,10 +549,12 @@ function buildGranularControlDiffs(
   return items;
 }
 
+// ─── 스냅샷 수집: WASM 단일 문서 → CompareDocumentSnapshot ─────────────────────
 /**
  * WASM이 열린 단일 문서에서 비교용 스냅샷을 만든다.
  * - 문단: 텍스트, 정규화 텍스트, stable_id, 레이아웃 앵커(커서 rect 기반), 구역 내 쪽번호
  * - 개체: 페이지 레이아웃 + 문단별 table 순회를 합쳐 키를 `sid:` 우선으로 통일
+ * - 마지막에 `canonicalControlKey`로 중복을 합치고 `controlSnapshotQuality`로 더 나은 요약을 남긴다.
  */
 function fillSnapshotFromWasm(
   wasm: WasmBridge,
@@ -810,6 +865,8 @@ function fillSnapshotFromWasm(
   };
 }
 
+// ─── 스냅샷 빌더 export (bytes vs 편집기 WASM) ─────────────────────────────────
+
 /** 디스크/외부 바이트 → 별도 WASM 인스턴스로 파싱 (stable_id는 이 인스턴스 세션 기준) */
 export async function buildSnapshotFromBytes(
   bytes: Uint8Array,
@@ -832,7 +889,10 @@ export function buildSnapshotFromWasm(
   return fillSnapshotFromWasm(wasm, info, displayName, options);
 }
 
-/** IR `stable_id` → 스냅샷 (문서 내 유일할 때만) */
+/**
+ * IR `stable_id` → 문단 스냅샷. 값이 비어 있으면 identity 경로를 쓸 수 없어 null.
+ * 동일 stable_id가 여러 번 나오면 `#0,#1,…` occurrence suffix로 키를 유일화한다(빈 문단 다수 문서).
+ */
 function buildStableIdMap(snap: CompareDocumentSnapshot): Map<string, CompareParaSnapshot> | null {
   const m = new Map<string, CompareParaSnapshot>();
   const seen = new Map<string, number>();
@@ -847,6 +907,8 @@ function buildStableIdMap(snap: CompareDocumentSnapshot): Map<string, ComparePar
   }
   return m;
 }
+
+// ─── identity 경로: 이력(동일 혈통)에서 stable_id 기준 O(N) 근사 텍스트 diff ───
 
 /**
  * identity 텍스트 비교: stable_id 정규화 키로 좌/우 문단을 1:1 매칭.
@@ -962,7 +1024,12 @@ function buildIdentityTextDiffs(left: CompareDocumentSnapshot, right: CompareDoc
   return diffs;
 }
 
-/** 호출부에서 지정한 strategy를 적용(단, identity 맵 구성 실패 시 alignment 폴백). */
+// ─── 전략 선택·순수 reflow 에 대한 moved 메타 제거 ───────────────────────────
+
+/**
+ * 호출부 `options.strategy`와 실제 가능 여부를 교차 검사한다.
+ * `identity`를 요청해도 양쪽 `buildStableIdMap`이 null이면 alignment로 내려가 변동성이 커질 수 있다.
+ */
 function resolveTextCompareStrategy(
   strategy: CompareStrategy,
   left: CompareDocumentSnapshot,
@@ -973,7 +1040,7 @@ function resolveTextCompareStrategy(
   return 'alignment';
 }
 
-/** suppressPureReflowMoves가 걸러낼 "문단 순서 이동"류 diff 식별 */
+/** `suppressPureReflowMoves`가 제거 대상으로 삼는 paragraphMeta 이동 항목만 true */
 function isParagraphMoveMeta(diff: DiffItem): boolean {
   return diff.kind === 'paragraphMeta' && (diff.id.includes('moved:') || diff.id.includes('id-moved:'));
 }
@@ -1041,16 +1108,21 @@ function suppressPureReflowMoves(
   });
 }
 
+// ─── alignment 중간 표현: 정렬 결과 한 줄(좌만·우만·양쪽) ─────────────────────
+
+/** `matchSegment*`의 출력 원소. null 쪽은 해당 문서에 문단이 없음(삽입/삭제 축). */
 type AlignedPair = {
   left: CompareParaSnapshot | null;
   right: CompareParaSnapshot | null;
 };
 
+/** 컨트롤 폴백 매칭 단계에서 확정된 (좌, 우) 쌍 */
 type ControlPair = {
   left: CompareControlSnapshot;
   right: CompareControlSnapshot;
 };
 
+/** diff의 path는 보통 "변경 후" 좌표를 우선하지만, 우측이 없으면 좌측을 쓴다. */
 function preferRightPath(
   left: { section: number; paragraph: number } | null,
   right: { section: number; paragraph: number } | null,
@@ -1061,8 +1133,9 @@ function preferRightPath(
 }
 
 /**
- * 한 쌍의 문단 배열 안에서만 시그니처 빈도를 세어, 양쪽 모두 유일한 문단끼리 단조 증가 쌍만 잡는다.
- * 전역 앵커가 없을 때 큰 구간을 쪼개 DP/그리디가 밀리지 않게 한다.
+ * **구간 한정** 유일 시그니처 앵커: `leftSeg`/`rightSeg` 안에서만 빈도를 세므로 전역 유일과는 다를 수 있다.
+ * 양쪽에서 정확히 1번씩만 나오는 시그니처끼리, 오른쪽 인덱스가 단조 증가하도록 쌍을 잡는다(LCS 앵커 느낌).
+ * `minTextLen`으로 너무 짧은 "우연 유일" 쌍을 줄인다.
  */
 function buildUniqueSigPairsInSlices(
   leftSeg: CompareParaSnapshot[],
@@ -1099,7 +1172,10 @@ function buildUniqueSigPairsInSlices(
   return pairs;
 }
 
-/** 전역 문단 배열에서 "길고 유일한" 동일 시그니처 쌍을 단조 ri로 잡아 alignment 구간 경계를 만든다 */
+/**
+ * 전역 문단 배열에서 "길고 유일한" 동일 시그니처 쌍을 단조 증가하는 `ri`로만 잡아 alignment 구간 경계를 만든다.
+ * 후보는 `fillSnapshotFromWasm`에서 미리 `isAnchorCandidate`로 거른다(짧은 문단·중복 시그니처 제외).
+ */
 function buildAnchorPairs(left: CompareParaSnapshot[], right: CompareParaSnapshot[]): Array<{ li: number; ri: number }> {
   const rightBySig = new Map<string, number[]>();
   for (let i = 0; i < right.length; i += 1) {
@@ -1125,9 +1201,10 @@ function buildAnchorPairs(left: CompareParaSnapshot[], right: CompareParaSnapsho
 }
 
 // ─── 문단 정렬: 유사도·구조·비용 (DP / 그리디 공통) ─────────────────────────────
-// textSimilarity: 스냅샷의 normalizedText 기준. 정렬 외 컨트롤 폴백 등에서도 호출될 수 있음.
-// isNearStructure / getEffectiveSimilarity / matchCost / scorePairGreedy 는 문단 쌍 정렬 전용.
+// `textSimilarity`: 스냅샷의 normalizedText 기준. 정렬 외 일부 휴리스틱에서도 호출된다.
+// `isNearStructure` / `getEffectiveSimilarity` / `matchCost` / `scorePairGreedy` 는 문단 쌍 정렬 전용.
 
+/** 문자 2-gram Dice 계수. 공백 제거 문자열에 사용해 형태소 단위 토큰이 없을 때도 신호를 남긴다. */
 function charBigramSimilarity(a: string, b: string): number {
   const aa = Array.from(a);
   const bb = Array.from(b);
@@ -1142,7 +1219,11 @@ function charBigramSimilarity(a: string, b: string): number {
   return (2 * inter) / (gramsA.size + gramsB.size);
 }
 
-/** 토큰+문자 바이그램 혼합 유사도 — 조사/접미 숫자 등 한국어 미세 변경에 둔감하게 매칭 */
+/**
+ * 토큰(공백 분리) + 문자 바이그램 혼합 유사도.
+ * 한국어는 조사/어미만 바뀌어도 토큰 집합이 크게 달라질 수 있어 `charSim`에 0.8 가중.
+ * `containsBoost`는 짧은 문자열이 긴 쪽에 거의 그대로 포함되는 경우(번호 접미 등)를 보정.
+ */
 function textSimilarity(a: string, b: string): number {
   if (!a && !b) return 1;
   if (!a || !b) return 0;
@@ -1281,14 +1362,16 @@ function matchSegment(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSnaps
 }
 
 /**
- * dp[i][j] = 왼쪽 i개·오른쪽 j개 문단까지 정렬 최소 비용.
- * 백트래킹 시 동률이면 match > delete > insert 우선(시각적 밀림 완화).
+ * 표준 2문자열 편집 DP를 "문단 시퀀스"에 적용한 것. `dp[i][j]` = 왼쪽 i개·오른쪽 j개까지 최소 비용.
+ * - 치환 비용은 `matchCost`(0~수렴)이고 삽입/삭제는 고정 `del`/`ins`(1.05)로 스무딩한다.
+ * - 백트래킹 동률 시 `match > delete > insert` 순으로 분기해, 삽입으로만 밀린 것처럼 보이는 경향을 줄인다.
  */
 function matchSegmentDp(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSnapshot[]): AlignedPair[] {
   if (shouldBailToGreedy()) return matchWindowedGreedy(leftSeg, rightSeg);
   const n = leftSeg.length;
   const m = rightSeg.length;
   const inf = 1e9;
+  /** 문단 한 줄 삽입/삭제 비용. 1.0보다 약간 크게 두어 무의미한 치환 남발을 억제 */
   const del = 1.05;
   const ins = 1.05;
   const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(inf));
@@ -1344,6 +1427,10 @@ function matchSegmentDp(leftSeg: CompareParaSnapshot[], rightSeg: CompareParaSna
   return out;
 }
 
+/**
+ * 윈도 그리디 전용 점수. 음수면 후보에서 제외(`sim`이 쌍별 임계 미만 등).
+ * 서명 일치(+5)·컨트롤 수 일치(+1)·구조 근접(`NEAR_STRUCTURE_GREEDY_BONUS`)에 `sim*3`을 더해 스케일을 맞춘다.
+ */
 function scorePairGreedy(lp: CompareParaSnapshot, rp: CompareParaSnapshot): number {
   const sim = getEffectiveSimilarity(lp, rp);
   if (lp.signature !== rp.signature && sim < softSimilarityThresholdForPair(lp, rp)) return -1;
@@ -1397,6 +1484,7 @@ function matchWindowedGreedy(leftSeg: CompareParaSnapshot[], rightSeg: ComparePa
       return aligned;
     }
     const rp = rightSeg[ri];
+    // 이전 매칭 위치 근처를 먼저 본 뒤, 실패 시 전 구간 재탐색(의역으로 인덱스가 크게 어긋난 경우).
     const start = Math.max(leftCursor, 0);
     const end = Math.min(leftSeg.length - 1, leftCursor + WINDOW_SIZE + WINDOW_SIZE);
     let { bestLi, bestScore, secondScore } = pickBestInRange(rp, start, end);
@@ -1522,19 +1610,20 @@ function shouldMergeRemovedAddedAsModify(lp: CompareParaSnapshot, rp: ComparePar
   return textSimilarity(lp.normalizedText, rp.normalizedText) >= REMOVED_ADDED_MERGE_SIM_MIN;
 }
 
+// ─── alignment 본문: 앵커 → 구간 정렬 → AlignedPair 스트림 후처리 ─────────────
+
 /**
- * alignment 직후 `shouldPromoteEmptyTextEdit`로 빈 문단 편집만 (삭제+추가)→변경 승격한다.
- */
-/**
- * alignment 본문 비교 — 단계별:
- * (1) `buildAnchorPairs` + 구간 슬라이스로 `aligned[]` 생성 (`matchSegment*`).
- * (2) 아래 for 루프는 **앞에서부터** 한 쌍씩 소비하며 DiffItem 을 쌓는다. 순서가 곧 우선순위(빈문단 승격 등).
- *     - 빈 문단 편집 → 단일 modified
- *     - (L,null)(null,R) / (null,R)(L,null) + 유사도·거리 → 삭제/추가 대신 modified-merged
- *     - (null,R1)(L,R2) + 쪼개기 유사도 → 라벨 순서 교정(변경+추가)
- *     - 단일 (null,R) / (L,null) → added / removed
- *     - (L,R) 둘 다 있으면 텍스트·이동·컨트롤 수 메타
- * (3) 정렬이 이미 잘못된 경우는 여기서 완전 복구 불가 → 상단 앵커·튜닝과 함께 봐야 함.
+ * 문서 대 문서(alignment) 텍스트 diff.
+ *
+ * (1) **앵커·구간 정렬** — `buildAnchorPairs`로 글로벌 뼈대를 잡고, 앵커 사이마다 `matchSegment`로
+ *     `AlignedPair[]`를 이어 붙인다. 여기까지가 "어느 문단과 어느 문단이 같은 줄인가"의 기계적 답.
+ * (2) **스트림 후처리** — 아래 for는 반드시 앞에서부터 순회한다. `i += 1`로 두 칸을 한 번에
+ *     소비하는 분기(빈 문단 승격·삭제+추가 병합·분할 재라벨)가 있어 순서가 결과에 직접 영향을 준다.
+ *     - `shouldPromoteEmptyTextEdit`: DP가 (삭제)(추가)로 쪼갠 빈↔비빈 문단을 modified 한 건으로 승격.
+ *     - `shouldMergeRemovedAddedAsModify`: (L,null)(null,R) 등을 유사도·거리로 수정 한 건으로 승격.
+ *     - `isLeftParagraphSplitIntoTwoRightParas`: (null,R앞)(L,R뒤) 순서를 사용자 기대(변경+추가)로 교정.
+ *     - 단일 null 반대편 → added / removed; (L,R) 양쪽 존재 → 텍스트·이동·컨트롤 수 메타.
+ * (3) **한계** — 정렬 단계에서 이미 엇갈린 매칭은 이 함수만으로 완전 복구되지 않는다. 앵커/튜닝·로그 ③을 함께 본다.
  */
 function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSnapshot): DiffItem[] {
   const diffs: DiffItem[] = [];
@@ -1557,6 +1646,7 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
       })),
     );
   }
+  // 경계: (문서 시작) — 앵커1 — … — 앵커N — (문서 끝). 각 앵커 쌍 자체는 1:1 고정 매칭.
   const boundaries = [{ li: -1, ri: -1 }, ...anchors, { li: lps.length, ri: rps.length }];
 
   const aligned: AlignedPair[] = [];
@@ -1568,6 +1658,7 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
       aligned.push({ left: lps[a.li], right: rps[a.ri] });
     }
 
+    // 앵커 (a)와 (b) "사이"의 문단만 DP/그리디에 넘긴다. 앵커 문단 본인은 위에서 이미 짝을 맞춤.
     const leftSeg = lps.slice(a.li + 1, b.li);
     const rightSeg = rps.slice(a.ri + 1, b.ri);
     if (leftSeg.length === 0 && rightSeg.length === 0) continue;
@@ -1780,13 +1871,17 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
   return diffs;
 }
 
+/** compareSnapshots 등에서 options 일부가 빠졌을 때의 기본값. kinds는 UI 노이즈를 줄이기 위해 화이트리스트 형태 */
 const DEFAULT_COMPARE_OPTIONS: CompareOptions = {
   caseSensitive: false,
   ignoreWhitespace: true,
   kinds: ['text', 'table', 'shape', 'image', 'chart', 'paragraphMeta'],
 };
 
+/** compareSnapshots 실행 중 `matchCost`/`resolveAnchorTuning` 등이 읽는 전역(스레드 안전은 요구하지 않음) */
 let activeCompareOptions: CompareOptions | null = null;
+
+// ─── 컨트롤 diff: 키 정확 매칭 → 폴백 → added/removed ─────────────────────────
 
 /**
  * 표/그림 등 컨트롤: kind+key로 1차 매칭 → 남은 것은 위치·요약 유사도로 폴백 매칭.
@@ -1855,6 +1950,10 @@ function buildControlDiffs(left: CompareDocumentSnapshot, right: CompareDocument
   return diffs;
 }
 
+/**
+ * key가 어긋난 좌/우 컨트롤을 탐욕적으로 짝지음. 오른쪽 하나당 왼쪽에서 최고 `scoreControlFallback`을 고른다.
+ * `bestScore >= 2.75` 미만이면 매칭하지 않아 오매칭 added/removed를 줄인다(표/그림 위치 휴리스틱).
+ */
 function pairControlsFallback(
   left: CompareControlSnapshot[],
   right: CompareControlSnapshot[],
@@ -1882,7 +1981,10 @@ function pairControlsFallback(
   return pairs;
 }
 
-/** 폴백 매칭 점수: 종류 일치, 요약 일치, 페이지/y 근접에 가산 */
+/**
+ * 폴백 매칭 점수: 종류·요약 일치에 큰 가중, 섹션/페이지/좌표 근접·control index 일치에 소수 가중.
+ * 음수는 불가능 쌍(kind 불일치). 임계 2.75와 함께 튜닝한다.
+ */
 function scoreControlFallback(l: CompareControlSnapshot, r: CompareControlSnapshot): number {
   if (l.kind !== r.kind) return -1;
   let score = 0;
@@ -1914,7 +2016,10 @@ function scoreControlFallback(l: CompareControlSnapshot, r: CompareControlSnapsh
   return score;
 }
 
-/** 각 DiffItem에 구역 내 표시 쪽번호(leftSectionPage/rightSectionPage)를 붙인다 */
+/**
+ * 각 DiffItem에 구역 내 "사람이 읽는" 쪽번호(`sectionPage`)를 붙인다.
+ * identity id 패턴·path·controlKey 내 sid를 역추적해 문단을 찾고, 실패 시 anchor의 전역 pageDisplayNumbers로 보완.
+ */
 function annotateDiffSectionPages(
   diffs: DiffItem[],
   left: CompareDocumentSnapshot,
@@ -1980,7 +2085,15 @@ function annotateDiffSectionPages(
   }
 }
 
-/** 이미 파싱된 스냅샷 두 개 비교 — 동일 WASM 세션 이력 등에서 stable_id 유지 */
+// ─── 공개 진입점: 스냅샷 비교 세션 생성 ───────────────────────────────────────
+
+/**
+ * 이미 파싱된 스냅샷 두 개를 비교해 `CompareSession`을 만든다.
+ *
+ * 파이프라인: (전략 결정: identity 가능 시 sid 1:1, 아니면 alignment) → 본문 diff → 컨트롤 diff 병합
+ * → `kinds` 필터 → `suppressPureReflowMoves` → `annotateDiffSectionPages` → 구역·문단 정렬.
+ * 성능: `activeRuntimeGuard`로 wall-clock 상한을 두고, 초과 시 alignment 내부가 그리디 위주로 동작할 수 있다.
+ */
 export function compareSnapshots(
   left: CompareDocumentSnapshot,
   right: CompareDocumentSnapshot,
@@ -2080,7 +2193,10 @@ export function compareSnapshots(
   }
 }
 
-/** 외부 두 파일(bytes): 각각 별도 WASM으로 스냅샷 → 공통 `compareSnapshots` 파이프라인 */
+/**
+ * 외부 두 파일(bytes): 각각 별도 WASM으로 스냅샷을 만든 뒤 `compareSnapshots`와 동일 파이프라인.
+ * 좌·우 stable_id 집합이 보통 겹치지 않아 alignment가 기본이 된다.
+ */
 export async function compareDocuments(
   leftBytes: Uint8Array,
   leftName: string,

@@ -32,10 +32,10 @@
  * - 1차: `kind::key` 정확 일치(`sid:…` 우선).
  * - 2차: **`buildRightToLeftParaMapFromAligned`** — `buildTextDiffs`가 만든 문단 정렬 `AlignedPair[]`에서
  *   오른쪽 `section:paragraph` → 짝 왼쪽 문단 맵을 구축해 `buildControlDiffs`에 전달한다.
- * - 3차: **`pairAlignmentSlotControls`** — 키가 어긋린 뒤에도, 오른쪽 컨트롤의 부모 문단이 맵상으로
- *   어느 왼쪽 문단과 짝인지 알면 **그 왼쪽 문단에 붙은 미매칭 컨트롤만** 후보로 삼고
- *   `scoreControlFallback + ALIGNMENT_CONTROL_SLOT_BONUS`로 짝을 찾는다(절대 y 밀림 보정).
- * - 4차: `extractTablePatiencePins`(표 요약 유일 키) → `pairControlsFallback`(전역 탐욕, 임계 2.75).
+ * - 3차: **`extractTablePatiencePins`** — 요약 키가 양쪽에서 각각 유일한 표를 슬롯보다 먼저 고정한다.
+ * - 4차: **`pairAlignmentSlotControls`** — 남은 컨트롤에 대해, 오른쪽 부모 문단의 맵상 짝 왼쪽 문단에 붙은
+ *   미매칭 컨트롤만 후보로 `scoreControlFallback + ALIGNMENT_CONTROL_SLOT_BONUS`로 짝을 찾는다.
+ * - 5차: `pairControlsFallback`(전역 탐욕, 임계 2.75).
  *
  * ── [단계적 비교(성능)]
  * - 전 문단×문단 유사도 행렬 같은 O(N²) 전역 최적화는 하지 않는다.
@@ -45,7 +45,8 @@
  * - 앵커·구간: ANCHOR_*, INTRA_UNIQUE_SIG_*, SEGMENT_DP_MAX, NORM_HASH_PIN_MIN_TOTAL_PARAS, HARD_SEGMENT_CELL_LIMIT,
  *   ALIGNMENT_MAX_COMPUTE_MS, MAX_SEGMENT_RECURSION
  * - 구조 근접·비용: NEAR_STRUCTURE_*, MATCH_SOFT_SIM_MIN, MATCH_COST_WEAK, WINDOW_SIZE, GREEDY_AMBIGUOUS_GAP
- * - 컨트롤 슬롯: ALIGNMENT_CONTROL_SLOT_BONUS, ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE
+ * - 컨트롤 슬롯: ALIGNMENT_CONTROL_SLOT_BONUS, ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE,
+ *   TABLE_SUMMARY_MISMATCH_PENALTY, TABLE_PAIR_SIM_NO_PENALTY, TABLE_PAIR_SIM_FULL_PENALTY
  * - 후처리: PARA_SPLIT_JOIN_SIM_MIN, REMOVED_ADDED_*
  * - 문자 요약: CHAR_DIFF_FULL_DP_MAX, CHAR_DIFF_TOTAL_MAX, CHAR_DIFF_CELL_HARD
  *
@@ -62,7 +63,7 @@
  * - 본 파일은 `// ───` 섹션 구분으로 점프 검색이 가능하다.
  */
 import { WasmBridge } from '@/core/wasm-bridge';
-import type { DocumentInfo, ParaProperties } from '@/core/types';
+import type { ControlLayoutItem, DocumentInfo, ParaProperties } from '@/core/types';
 import { compareDbg, isCompareDebugEnabled } from './compare-debug';
 import type {
   CompareAnchorTuning,
@@ -160,6 +161,16 @@ const ALIGNMENT_CONTROL_SLOT_BONUS = 2.35;
  * 너무 낮추면 다른 문단 개체와 오매칭, 너무 높이면 슬롯이 거의 동작하지 않는다.
  */
 const ALIGNMENT_CONTROL_MIN_ADJUSTED_SCORE = 4.38;
+/**
+ * `scoreControlFallback`: 표 요약(`summary`)이 다를 때 부과하는 **최대** 감점.
+ * `tableControlPairContentSimilarity`가 높으면(같은 행·열 그리드에서 셀만 수정) 감점 비율을 0에 가깝게 줄여
+ * `buildGranularControlDiffs`로 “표 수정”이 나가게 한다. 유사도가 낮으면(다른 표) 전액 감점한다.
+ */
+const TABLE_SUMMARY_MISMATCH_PENALTY = 4.25;
+/** 이 이상이면 표 요약 불일치 감점을 적용하지 않는다(한 셀 수정 등). */
+const TABLE_PAIR_SIM_NO_PENALTY = 0.74;
+/** 이 이하이면 표 감점을 전액 적용한다(내용이 다른 표). */
+const TABLE_PAIR_SIM_FULL_PENALTY = 0.36;
 
 /** `compareSnapshots` 한 번 호출 동안만 유효. `ALIGNMENT_MAX_COMPUTE_MS` 경과 시 greedy 쪽으로 이탈한다. */
 type CompareRuntimeGuard = {
@@ -641,7 +652,7 @@ function paraPosKey(p: { section: number; paragraph: number }): string {
  * - 키: `paraPosKey(right)` (오른쪽 HWP 좌표계).
  * - 값: DP/그리디가 같은 논리 슬롯으로 판단한 `left` 문단.
  * `(null, right)`·`(left, null)` 삽입/삭제 축은 맵에 넣지 않는다 → 해당 문단의 컨트롤은 슬롯 매칭 대상에서 제외되고
- * 이후 `extractTablePatiencePins` / `pairControlsFallback` / added·removed로 처리된다.
+ * 이후 `extractTablePatiencePins`(선행) → `pairAlignmentSlotControls` → `pairControlsFallback` / added·removed로 처리된다.
  */
 function buildRightToLeftParaMapFromAligned(aligned: AlignedPair[]): Map<string, CompareParaSnapshot> {
   const m = new Map<string, CompareParaSnapshot>();
@@ -739,7 +750,7 @@ function buildGranularControlDiffs(
       ? `${tableLabel} 텍스트 변경(구조변경 동반${changedCells > 0 ? `, ${changedCells}셀` : ''})`
       : `${tableLabel} 텍스트 변경${changedCells > 0 ? `(${changedCells}셀)` : ''}`;
     push('text', textTitle, lText, rText, tableTextChanged);
-    push('style', `${tableLabel} 속성 변경`, `props=${lk.props ?? '(없음)'}`, `props=${rk.props ?? '(없음)'}`);
+    // props= 는 `getTableProperties` 전체 JSON 해시라 조판·저장 경로만 달라도 달라져 노이즈가 크다. UI에는 내리지 않는다.
     return items;
   }
 
@@ -781,8 +792,136 @@ function compactParaShapeForAnchor(pp: ParaProperties): string {
 }
 
 /**
+ * `getCursorRect(sec,para,0)`이 실패하는 문단(표 셀 내부·빈 줄 등)에 대해 오프셋을 바꿔 재시도한다.
+ */
+function tryResolveCompareParaAnchorFromCursor(
+  wasm: WasmBridge,
+  sec: number,
+  para: number,
+  textLength: number,
+): DiffAnchor | undefined {
+  const offsets = new Set<number>([0]);
+  if (textLength > 0) {
+    offsets.add(1);
+    offsets.add(Math.max(0, textLength - 1));
+    if (textLength > 2) offsets.add(Math.floor(textLength / 2));
+  }
+  for (const off of offsets) {
+    try {
+      const rect = wasm.getCursorRect(sec, para, off);
+      if (rect && typeof rect.pageIndex === 'number' && Number.isFinite(rect.x) && Number.isFinite(rect.y)) {
+        return {
+          pageIndex: rect.pageIndex,
+          x: rect.x,
+          y: rect.y,
+          width: 320,
+          height: Math.max(18, rect.height || 18),
+        };
+      }
+    } catch {
+      /* 다음 오프셋 */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * 커서 rect를 못 얻은 문단에 대해, 해당 문단에 붙은 첫 레이아웃 개체 박스로 앵커를 채운다(비교 상세 캔버스용).
+ */
+function fillMissingParaAnchorsFromPageLayout(
+  wasm: WasmBridge,
+  info: DocumentInfo,
+  paragraphs: CompareParaSnapshot[],
+  displayedPageByGlobalPage: Map<number, number>,
+): void {
+  const firstBoxByPara = new Map<string, DiffAnchor>();
+  for (let page = 0; page < info.pageCount; page += 1) {
+    let controls: ControlLayoutItem[];
+    try {
+      controls = wasm.getPageControlLayout(page).controls;
+    } catch {
+      continue;
+    }
+    for (const item of controls) {
+      const sec = item.secIdx;
+      const pIdx = item.paraIdx;
+      if (sec == null || pIdx == null || sec < 0 || pIdx < 0) continue;
+      const key = `${sec}:${pIdx}`;
+      if (firstBoxByPara.has(key)) continue;
+      firstBoxByPara.set(key, {
+        pageIndex: page,
+        x: item.x,
+        y: item.y,
+        width: Math.max(48, Math.round(item.w)),
+        height: Math.max(18, Math.round(item.h)),
+      });
+    }
+  }
+  for (const p of paragraphs) {
+    if (p.anchor) continue;
+    const fb = firstBoxByPara.get(`${p.section}:${p.paragraph}`);
+    if (!fb) continue;
+    p.anchor = fb;
+    p.sectionPage = displayedPageByGlobalPage.get(fb.pageIndex) ?? (fb.pageIndex + 1);
+  }
+}
+
+/**
+ * 레이아웃에도 없으면 같은 구역에서 가장 가까운 앵커가 있는 문단 좌표를 복사한다.
+ * 이전 문단 앵커를 **그대로** 쓰면(표가 있는 문단 등) 비교 상세 마커가 표 위에 겹쳐 “문단 추가 = 표”로 보이므로 세로로 한 칸 밀어 구분한다.
+ */
+function fillMissingParaAnchorsFromNeighbors(
+  paragraphs: CompareParaSnapshot[],
+  displayedPageByGlobalPage: Map<number, number>,
+): void {
+  for (const p of paragraphs) {
+    if (p.anchor) continue;
+    let nbr: DiffAnchor | undefined;
+    let fromPreviousPara = false;
+    for (let gi = p.globalIndex - 1; gi >= 0; gi -= 1) {
+      const q = paragraphs[gi];
+      if (q.section !== p.section) break;
+      if (q.anchor) {
+        nbr = q.anchor;
+        fromPreviousPara = true;
+        break;
+      }
+    }
+    if (!nbr) {
+      for (let gi = p.globalIndex + 1; gi < paragraphs.length; gi += 1) {
+        const q = paragraphs[gi];
+        if (q.section !== p.section) break;
+        if (q.anchor) {
+          nbr = q.anchor;
+          fromPreviousPara = false;
+          break;
+        }
+      }
+    }
+    if (!nbr) continue;
+    if (fromPreviousPara) {
+      const dy = Math.min(200, Math.max(28, Math.round(nbr.height) + 10));
+      p.anchor = {
+        ...nbr,
+        y: nbr.y + dy,
+        width: nbr.width,
+        height: Math.max(18, nbr.height),
+      };
+    } else {
+      p.anchor = {
+        ...nbr,
+        y: Math.max(0, nbr.y - 28),
+        width: nbr.width,
+        height: Math.max(18, nbr.height),
+      };
+    }
+    p.sectionPage = displayedPageByGlobalPage.get(nbr.pageIndex) ?? (nbr.pageIndex + 1);
+  }
+}
+
+/**
  * WASM이 열린 단일 문서에서 비교용 스냅샷을 만든다.
- * - 문단: 텍스트, 정규화 텍스트, stable_id, 레이아웃 앵커(커서 rect 기반), 구역 내 쪽번호,
+ * - 문단: 텍스트, 정규화 텍스트, stable_id, 레이아웃 앵커(커서 rect·다중 오프셋 → 페이지 개체 박스 → 이웃 문단), 구역 내 쪽번호,
  *   `signature`(정규화 텍스트·컨트롤 개수 + `getParaPropertiesAt` 기반 문단모양 요약 `ps:`)
  * - 개체: 페이지 레이아웃 + 문단별 table 순회를 합쳐 키를 `sid:` 우선으로 통일
  * - 마지막에 `canonicalControlKey`로 중복을 합치고 `controlSnapshotQuality`로 더 나은 요약을 남긴다.
@@ -832,21 +971,7 @@ function fillSnapshotFromWasm(
         `${normalizedText}|cc:${controls.length}${shapeDigest ? `|ps:${shapeDigest}` : ''}`,
       );
       const stableId = wasm.getParagraphStableId(sec, para);
-      const anchor = (() => {
-        try {
-          const rect = wasm.getCursorRect(sec, para, 0);
-          return {
-            pageIndex: rect.pageIndex,
-            x: rect.x,
-            y: rect.y,
-            // 문단 시작 위치 기준 넓은 박스: UI 하이라이트·hitTest에 쓰기 위함(정밀 bbox는 아님)
-            width: 320,
-            height: Math.max(18, rect.height || 18),
-          };
-        } catch {
-          return undefined;
-        }
-      })();
+      const anchor = tryResolveCompareParaAnchorFromCursor(wasm, sec, para, length);
       const sectionPage = (() => {
         if (!anchor) return 1;
         return displayedPageByGlobalPage.get(anchor.pageIndex) ?? (anchor.pageIndex + 1);
@@ -867,6 +992,9 @@ function fillSnapshotFromWasm(
       globalIndex += 1;
     }
   }
+
+  fillMissingParaAnchorsFromPageLayout(wasm, info, paragraphs, displayedPageByGlobalPage);
+  fillMissingParaAnchorsFromNeighbors(paragraphs, displayedPageByGlobalPage);
 
   // 글로벌 앵커 후보(`isAnchorCandidate`): 시그니처 중복은 즉시 탈락. 그 다음
   // - 길이·엔트로피 등으로 “긴” 문단은 `isAnchorTextQualityOk`
@@ -1168,6 +1296,34 @@ function buildStableIdMap(snap: CompareDocumentSnapshot): Map<string, ComparePar
   return m;
 }
 
+/** ZWSP·NBSP 등만 남은 문단도 “빈 문단”으로 본다. */
+function isEffectivelyEmptyParaNormalized(normalizedText: string): boolean {
+  const t = normalizedText
+    .replace(/[\u200b-\u200d\ufeff]/g, '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return t.length === 0;
+}
+
+/** 텍스트·개체 없는 문단: 정렬/스냅샷 노이즈로 추가·삭제만 남는 경우 diff에서 생략한다. */
+function shouldSuppressNoiseParagraphOnly(p: CompareParaSnapshot): boolean {
+  return p.controlCount === 0 && isEffectivelyEmptyParaNormalized(p.normalizedText);
+}
+
+/** 정렬 스텝에서 빈 고아 문단만 제거해 cleanup 2글자 패턴이 깨지지 않게 한다. */
+function stripNoiseOnlyParagraphAlignSteps(steps: ParagraphAlignStep[]): ParagraphAlignStep[] {
+  return steps.filter((s) => {
+    if (s.kind === 'r') return !shouldSuppressNoiseParagraphOnly(s.r);
+    if (s.kind === 'l') return !shouldSuppressNoiseParagraphOnly(s.l);
+    return true;
+  });
+}
+
+function formatParaLocTitle(p: { section: number; paragraph: number }): string {
+  return `구역 ${p.section}, 문단 ${p.paragraph}`;
+}
+
 // ─── identity 경로: 이력(동일 혈통)에서 stable_id 기준 O(N) 근사 텍스트 diff ───
 
 /**
@@ -1207,29 +1363,33 @@ function buildIdentityTextDiffs(left: CompareDocumentSnapshot, right: CompareDoc
     const l = lmap.get(id);
     const r = rmap.get(id);
     if (l && !r) {
-      diffs.push({
-        id: mkDiffId('text', `id-removed:${id}`),
-        kind: 'text',
-        severity: 'removed',
-        path: { section: l.section, paragraph: l.paragraph },
-        title: '문단 삭제',
-        leftPreview: l.text,
-        rightPreview: '',
-        leftAnchor: l.anchor,
-      });
+      if (!shouldSuppressNoiseParagraphOnly(l)) {
+        diffs.push({
+          id: mkDiffId('text', `id-removed:${id}`),
+          kind: 'text',
+          severity: 'removed',
+          path: { section: l.section, paragraph: l.paragraph },
+          title: '문단 삭제',
+          leftPreview: l.text,
+          rightPreview: '',
+          leftAnchor: l.anchor,
+        });
+      }
       continue;
     }
     if (!l && r) {
-      diffs.push({
-        id: mkDiffId('text', `id-added:${id}`),
-        kind: 'text',
-        severity: 'added',
-        path: { section: r.section, paragraph: r.paragraph },
-        title: '문단 추가',
-        leftPreview: '',
-        rightPreview: r.text,
-        rightAnchor: r.anchor,
-      });
+      if (!shouldSuppressNoiseParagraphOnly(r)) {
+        diffs.push({
+          id: mkDiffId('text', `id-added:${id}`),
+          kind: 'text',
+          severity: 'added',
+          path: { section: r.section, paragraph: r.paragraph },
+          title: '문단 추가',
+          leftPreview: '',
+          rightPreview: r.text,
+          rightAnchor: r.anchor,
+        });
+      }
       continue;
     }
     if (!l || !r) continue;
@@ -2098,7 +2258,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'text',
         severity: 'modified',
         path: preferRightPath(s0.l, s1.r),
-        title: `텍스트 변경 (${s0.l.section}.${s0.l.paragraph})`,
+        title: `텍스트 변경 (${formatParaLocTitle(s0.l)})`,
         leftPreview: s0.l.text,
         rightPreview: s1.r.text,
         leftAnchor: s0.l.anchor,
@@ -2113,7 +2273,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'text',
         severity: 'modified',
         path: preferRightPath(s1.l, s0.r),
-        title: `텍스트 변경 (${s1.l.section}.${s1.l.paragraph})`,
+        title: `텍스트 변경 (${formatParaLocTitle(s1.l)})`,
         leftPreview: s1.l.text,
         rightPreview: s0.r.text,
         leftAnchor: s1.l.anchor,
@@ -2130,7 +2290,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'text',
         severity: 'modified',
         path: preferRightPath(s0.l, r2),
-        title: `텍스트 변경 (${r2.section}.${r2.paragraph})`,
+        title: `텍스트 변경 (${formatParaLocTitle(r2)})`,
         leftPreview: s0.l.text,
         rightPreview: r2.text,
         leftAnchor: s0.l.anchor,
@@ -2148,7 +2308,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'text',
         severity: 'modified',
         path: preferRightPath(l2, s0.r),
-        title: `텍스트 변경 (${s0.r.section}.${s0.r.paragraph})`,
+        title: `텍스트 변경 (${formatParaLocTitle(s0.r)})`,
         leftPreview: l2.text,
         rightPreview: s0.r.text,
         leftAnchor: l2.anchor,
@@ -2170,7 +2330,7 @@ function cleanupParagraphAlignStepsToDiffItems(
           kind: 'text',
           severity: 'modified',
           path: preferRightPath(L, rHead),
-          title: `텍스트 변경 (${rHead.section}.${rHead.paragraph})`,
+          title: `텍스트 변경 (${formatParaLocTitle(rHead)})`,
           leftPreview: L.text,
           rightPreview: rHead.text,
           leftAnchor: L.anchor,
@@ -2178,17 +2338,21 @@ function cleanupParagraphAlignStepsToDiffItems(
           leftSectionPage: L.sectionPage,
           rightSectionPage: rHead.sectionPage,
         },
-        {
-          id: mkDiffId('text', `added:${rTail.section}:${rTail.paragraph}`),
-          kind: 'text',
-          severity: 'added',
-          path: { section: rTail.section, paragraph: rTail.paragraph },
-          title: `문단 추가 (${rTail.section}.${rTail.paragraph})`,
-          leftPreview: '',
-          rightPreview: rTail.text,
-          rightAnchor: rTail.anchor,
-          rightSectionPage: rTail.sectionPage,
-        },
+        ...(shouldSuppressNoiseParagraphOnly(rTail)
+          ? []
+          : [
+              {
+                id: mkDiffId('text', `added:${rTail.section}:${rTail.paragraph}`),
+                kind: 'text' as const,
+                severity: 'added' as const,
+                path: { section: rTail.section, paragraph: rTail.paragraph },
+                title: `문단 추가 (${formatParaLocTitle(rTail)})`,
+                leftPreview: '',
+                rightPreview: rTail.text,
+                rightAnchor: rTail.anchor,
+                rightSectionPage: rTail.sectionPage,
+              },
+            ]),
       );
       i += 2;
       continue;
@@ -2196,33 +2360,37 @@ function cleanupParagraphAlignStepsToDiffItems(
 
     if (s0.kind === 'r') {
       const r = s0.r;
-      diffs.push({
-        id: mkDiffId('text', `added:${r.section}:${r.paragraph}`),
-        kind: 'text',
-        severity: 'added',
-        path: { section: r.section, paragraph: r.paragraph },
-        title: `문단 추가 (${r.section}.${r.paragraph})`,
-        leftPreview: '',
-        rightPreview: r.text,
-        rightAnchor: r.anchor,
-        rightSectionPage: r.sectionPage,
-      });
+      if (!shouldSuppressNoiseParagraphOnly(r)) {
+        diffs.push({
+          id: mkDiffId('text', `added:${r.section}:${r.paragraph}`),
+          kind: 'text',
+          severity: 'added',
+          path: { section: r.section, paragraph: r.paragraph },
+          title: `문단 추가 (${formatParaLocTitle(r)})`,
+          leftPreview: '',
+          rightPreview: r.text,
+          rightAnchor: r.anchor,
+          rightSectionPage: r.sectionPage,
+        });
+      }
       i += 1;
       continue;
     }
     if (s0.kind === 'l') {
       const l = s0.l;
-      diffs.push({
-        id: mkDiffId('text', `removed:${l.section}:${l.paragraph}`),
-        kind: 'text',
-        severity: 'removed',
-        path: preferRightPath(l, null),
-        title: `문단 삭제 (${l.section}.${l.paragraph})`,
-        leftPreview: l.text,
-        rightPreview: '',
-        leftAnchor: l.anchor,
-        leftSectionPage: l.sectionPage,
-      });
+      if (!shouldSuppressNoiseParagraphOnly(l)) {
+        diffs.push({
+          id: mkDiffId('text', `removed:${l.section}:${l.paragraph}`),
+          kind: 'text',
+          severity: 'removed',
+          path: preferRightPath(l, null),
+          title: `문단 삭제 (${formatParaLocTitle(l)})`,
+          leftPreview: l.text,
+          rightPreview: '',
+          leftAnchor: l.anchor,
+          leftSectionPage: l.sectionPage,
+        });
+      }
       i += 1;
       continue;
     }
@@ -2235,7 +2403,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'text',
         severity: 'modified',
         path: preferRightPath(l, r),
-        title: `텍스트 변경 (${l.section}.${l.paragraph})`,
+        title: `텍스트 변경 (${formatParaLocTitle(l)})`,
         leftPreview: l.text,
         rightPreview: r.text,
         leftAnchor: l.anchor,
@@ -2249,7 +2417,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'paragraphMeta',
         severity: 'modified',
         path: { section: l.section, paragraph: l.paragraph },
-        title: `문단 이동 감지 (${l.section}.${l.paragraph})`,
+        title: `문단 이동 감지 (${formatParaLocTitle(l)})`,
         leftPreview: `A idx=${l.globalIndex}`,
         rightPreview: `B idx=${r.globalIndex}`,
         leftAnchor: l.anchor,
@@ -2263,7 +2431,7 @@ function cleanupParagraphAlignStepsToDiffItems(
         kind: 'paragraphMeta',
         severity: 'modified',
         path: { section: l.section, paragraph: l.paragraph },
-        title: `문단 개체 수 변경 (${l.section}.${l.paragraph})`,
+        title: `문단 개체 수 변경 (${formatParaLocTitle(l)})`,
         leftPreview: `controls=${l.controlCount}`,
         rightPreview: `controls=${r.controlCount}`,
         leftAnchor: l.anchor,
@@ -2334,7 +2502,7 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
   }
 
   const rightToLeftPara = buildRightToLeftParaMapFromAligned(aligned);
-  const steps = buildParagraphAlignStepsFromAligned(aligned);
+  const steps = stripNoiseOnlyParagraphAlignSteps(buildParagraphAlignStepsFromAligned(aligned));
   const diffs = cleanupParagraphAlignStepsToDiffItems(steps, lps, rps);
   return { diffs, rightToLeftPara };
 }
@@ -2343,7 +2511,8 @@ function buildTextDiffs(left: CompareDocumentSnapshot, right: CompareDocumentSna
  * 키가 달라진 뒤에도 **표(table)** 만 모아, 요약 문자열에서 뽑은 키(`txt` / `sig` / 해시) 기준으로
  * 양쪽 문서에서 각각 **정확히 한 개**뿐인 표끼리 1:1 고정한다(Git Patience 유사).
  *
- * 문단 슬롯(`pairAlignmentSlotControls`)이 먼저 돌기 때문에, 동일 표가 이미 짝지어졌으면 여기까지 내려오지 않는다.
+ * `buildControlDiffs`에서는 **정렬 슬롯보다 먼저** 호출한다. 삽입으로 키가 어긋져도 요약이 유일하게 대응되면
+ * 같은 내용의 표가 먼저 짝지어져, 슬롯이 위치만 보고 엉뚱한 표를 가져가는 일을 줄인다.
  * 이 단계는 표 요약이 충분히 구별될 때만 효과가 있다.
  */
 function extractTablePatiencePins(
@@ -2467,7 +2636,7 @@ function pairAlignmentSlotControls(
 
 /** compareSnapshots 등에서 options 일부가 빠졌을 때의 기본값. kinds는 UI 노이즈를 줄이기 위해 화이트리스트 형태 */
 const DEFAULT_COMPARE_OPTIONS: CompareOptions = {
-  caseSensitive: false,
+  caseSensitive: true,
   ignoreWhitespace: true,
   kinds: ['text', 'table', 'shape', 'image', 'chart', 'paragraphMeta'],
 };
@@ -2475,20 +2644,20 @@ const DEFAULT_COMPARE_OPTIONS: CompareOptions = {
 /** compareSnapshots 실행 중 `matchCost`/`resolveAnchorTuning` 등이 읽는 전역(스레드 안전은 요구하지 않음) */
 let activeCompareOptions: CompareOptions | null = null;
 
-// ─── 컨트롤 diff: 키 매칭 → 정렬 슬롯 → 표 patience 핀 → 폴백 → added/removed ───
+// ─── 컨트롤 diff: 키 매칭 → 표 patience 핀 → 정렬 슬롯 → 폴백 → added/removed ───
 
 /**
  * 표·도형·그림 등 컨트롤 diff. 단계:
  *
  * 1. **키 정확 매칭** — `kind::key`(우선 `sid:paraStableId:ci:type`). 좌우 동시 존재하면 내용 비교 후
  *    `buildGranularControlDiffs` 또는 동일 시 생략. 한쪽만 있으면 unmatched 버퍼.
- * 2. **정렬 슬롯**(`rightToLeftPara`가 비어 있지 않을 때) — `pairAlignmentSlotControls`.
+ * 2. **표 Patience(선행)** — `extractTablePatiencePins`(요약 키가 양쪽에서 각각 유일할 때).
+ * 3. **정렬 슬롯**(`rightToLeftPara`가 비어 있지 않을 때) — `pairAlignmentSlotControls`.
  *    짝이 맞고 요약·종류까지 같으면 diff 생략(순수 밀림), 다르면 `align-slot:` 스템으로 상세 diff.
- * 3. **표 Patience** — `extractTablePatiencePins`(요약에서 뽑은 키가 양쪽 유일할 때).
  * 4. **전역 폴백** — `pairControlsFallback`(임계 2.75). 동일 요약·타입이면 생략.
  * 5. 남은 항목은 added / removed.
  *
- * `identity` 전략에서는 맵이 비어 2단계가 no-op이 된다.
+ * `identity` 전략에서는 `rightToLeftPara`가 비어 3단계 슬롯만 no-op이며, 2단계 Patience는 그대로 적용된다.
  */
 function buildControlDiffs(
   left: CompareDocumentSnapshot,
@@ -2516,10 +2685,21 @@ function buildControlDiffs(
     if (r) unmatchedRight.push(r);
   }
 
-  let slotRestL = unmatchedLeft;
-  let slotRestR = unmatchedRight;
+  const {
+    pins: tablePins,
+    restLeft: afterPatienceL,
+    restRight: afterPatienceR,
+  } = extractTablePatiencePins(unmatchedLeft, unmatchedRight);
+  for (const { left: l, right: r } of tablePins) {
+    if (l.summary !== r.summary || l.kind !== r.kind) {
+      diffs.push(...buildGranularControlDiffs(l, r, `table-pin:${l.key}=>${r.key}`));
+    }
+  }
+
+  let slotRestL = afterPatienceL;
+  let slotRestR = afterPatienceR;
   if (rightToLeftPara && rightToLeftPara.size > 0) {
-    const slot = pairAlignmentSlotControls(unmatchedLeft, unmatchedRight, rightToLeftPara);
+    const slot = pairAlignmentSlotControls(afterPatienceL, afterPatienceR, rightToLeftPara);
     for (const { left: l, right: r } of slot.pairs) {
       if (l.summary !== r.summary || l.kind !== r.kind) {
         diffs.push(...buildGranularControlDiffs(l, r, `align-slot:${l.key}=>${r.key}`));
@@ -2529,15 +2709,8 @@ function buildControlDiffs(
     slotRestR = slot.restRight;
   }
 
-  const { pins, restLeft, restRight } = extractTablePatiencePins(slotRestL, slotRestR);
-  for (const { left: l, right: r } of pins) {
-    if (l.summary !== r.summary || l.kind !== r.kind) {
-      diffs.push(...buildGranularControlDiffs(l, r, `table-pin:${l.key}=>${r.key}`));
-    }
-  }
-
   // 2차: key가 달라진 컨트롤(특히 표/이미지)의 폴백 매칭
-  const fallbackPairs = pairControlsFallback(restLeft, restRight);
+  const fallbackPairs = pairControlsFallback(slotRestL, slotRestR);
   const pairedL = new Set(fallbackPairs.map((p) => p.left));
   const pairedR = new Set(fallbackPairs.map((p) => p.right));
   for (const { left: l, right: r } of fallbackPairs) {
@@ -2546,7 +2719,7 @@ function buildControlDiffs(
     diffs.push(...buildGranularControlDiffs(l, r, `fallback-modified:${l.key}=>${r.key}`));
   }
 
-  for (const r of restRight) {
+  for (const r of slotRestR) {
     if (pairedR.has(r)) continue;
     const key = `${r.kind}::${r.key}`;
     diffs.push({
@@ -2560,7 +2733,7 @@ function buildControlDiffs(
       rightAnchor: r.anchor,
     });
   }
-  for (const l of restLeft) {
+  for (const l of slotRestL) {
     if (pairedL.has(l)) continue;
     const key = `${l.kind}::${l.key}`;
     diffs.push({
@@ -2578,10 +2751,10 @@ function buildControlDiffs(
 }
 
 /**
- * 키·슬롯·표 핀 이후에도 남은 좌·우 컨트롤을 **전역 탐욕**으로 짝지음(오른쪽 각각에 대해 왼쪽 후보 중 최고점).
+ * 키·표 Patience·슬롯 이후에도 남은 좌·우 컨트롤을 **전역 탐욕**으로 짝지음(오른쪽 각각에 대해 왼쪽 후보 중 최고점).
  *
  * `bestScore >= 2.75` 미만이면 매칭하지 않는다 — 절대 좌표·요약 유사도만으로 오매칭하면 added/removed 노이즈가 커지기 때문.
- * 문단 정렬이 신뢰되는 경우에는 먼저 `pairAlignmentSlotControls`가 같은 논리 문단 안에서 점수 보너스를 준다.
+ * 문단 정렬이 신뢰되는 경우에는 `pairAlignmentSlotControls`가 같은 논리 문단 안에서 점수 보너스를 준다.
  */
 function pairControlsFallback(
   left: CompareControlSnapshot[],
@@ -2611,10 +2784,45 @@ function pairControlsFallback(
 }
 
 /**
+ * 표 한 쌍의 “같은 표에서 셀만 바뀜” 정도를 0~1로 본다. 행·열(r/c)이 다르면 낮게 나와 전액 감점된다.
+ */
+function tableControlPairContentSimilarity(l: CompareControlSnapshot, r: CompareControlSnapshot): number {
+  const lk = parseSummaryKV(l.summary);
+  const rk = parseSummaryKV(r.summary);
+  const sameGrid = (lk.r ?? '') === (rk.r ?? '') && (lk.c ?? '') === (rk.c ?? '');
+  if (!sameGrid) return 0.08;
+
+  const pickCells = (kv: Record<string, string>) => {
+    const cp = kv.cprev;
+    if (cp && cp !== '(없음)') return cp;
+    const tp = kv.tprev;
+    if (tp && tp !== '(없음)') return tp;
+    return kv.txt ?? '';
+  };
+  const a = pickCells(lk);
+  const b = pickCells(rk);
+  if (a || b) return textSimilarity(a, b);
+
+  const shaL = lk.csha ?? '';
+  const shaR = rk.csha ?? '';
+  if (shaL && shaR && shaL === shaR) return 1;
+
+  return textSimilarity(l.summary.replace(/\s+/g, ' '), r.summary.replace(/\s+/g, ' '));
+}
+
+function tableSummaryMismatchPenaltyFactor(l: CompareControlSnapshot, r: CompareControlSnapshot): number {
+  const sim = tableControlPairContentSimilarity(l, r);
+  if (sim >= TABLE_PAIR_SIM_NO_PENALTY) return 0;
+  if (sim <= TABLE_PAIR_SIM_FULL_PENALTY) return 1;
+  return (TABLE_PAIR_SIM_NO_PENALTY - sim) / (TABLE_PAIR_SIM_NO_PENALTY - TABLE_PAIR_SIM_FULL_PENALTY);
+}
+
+/**
  * `pairControlsFallback` / `pairAlignmentSlotControls` 공통 점수 함수.
  *
  * - kind 불일치 → -1 (즉시 탈락).
  * - 동일 `type`, 동일 `summary`에 큰 가중(표·도형은 요약 문자열에 구조·텍스트 요약이 들어 있음).
+ * - **표끼리 요약이 다르면** `TABLE_SUMMARY_MISMATCH_PENALTY`를 **내용 유사도에 비례해** 감점(같은 그리드·거의 같은 셀 문자열이면 감점 없음).
  * - 그다음 `sid`/`loc` 키에서 뽑은 **control index** 일치, 같은 section, 페이지 간격, 앵커 박스 x/y/wh 근접.
  *
  * 문단 삽입으로 y가 크게 밀리면 위치 항만으로는 2.75에 못 미칠 수 있어, alignment 맵이 있을 때는
@@ -2648,6 +2856,10 @@ function scoreControlFallback(l: CompareControlSnapshot, r: CompareControlSnapsh
   else if (yGap < 180) score += 0.3;
   if (wGap < 45 && hGap < 45) score += 0.45;
   else if (wGap < 120 && hGap < 120) score += 0.22;
+  if (l.kind === 'table' && r.kind === 'table' && l.summary !== r.summary) {
+    const factor = tableSummaryMismatchPenaltyFactor(l, r);
+    score -= TABLE_SUMMARY_MISMATCH_PENALTY * factor;
+  }
   return score;
 }
 

@@ -66,6 +66,8 @@ impl DocumentCore {
         // (한컴에서 메모 추가 시 안내문 텍스트가 필드 값으로 삽입됨 — compose 전에 제거해야 정합성 유지)
         Self::clear_initial_field_texts(&mut document);
 
+        let stable_id_serial = Paragraph::assign_stable_ids_for_document(&mut document);
+
         let composed = document
             .sections
             .iter()
@@ -105,6 +107,7 @@ impl DocumentCore {
             para_offset: Vec::new(),
             source_format,
             validation_report,
+            stable_id_serial,
         };
 
         doc.paginate();
@@ -549,6 +552,11 @@ impl DocumentCore {
     /// 문서 IR을 직접 설정한다 (테스트/네이티브 전용).
     pub fn set_document(&mut self, doc: Document) {
         self.document = doc;
+        self.stable_id_serial = crate::model::paragraph::next_stable_serial_after_existing(&self.document);
+        crate::model::paragraph::Paragraph::fill_empty_stable_ids_in_document(
+            &mut self.document,
+            &mut self.stable_id_serial,
+        );
         self.styles = resolve_styles(&self.document.doc_info, self.dpi);
         self.composed = self.document.sections.iter()
             .map(|s| compose_section(s))
@@ -597,6 +605,11 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("스냅샷 {} 없음", id)))?;
         let (_, doc) = self.snapshot_store[idx].clone();
         self.document = doc;
+        self.stable_id_serial = crate::model::paragraph::next_stable_serial_after_existing(&self.document);
+        crate::model::paragraph::Paragraph::fill_empty_stable_ids_in_document(
+            &mut self.document,
+            &mut self.stable_id_serial,
+        );
         // 캐시 전체 재구성
         self.styles = resolve_styles(&self.document.doc_info, self.dpi);
         self.composed = self.document.sections.iter()

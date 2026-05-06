@@ -1,6 +1,7 @@
 //! 문단 (Paragraph, CharRun, LineSeg, RangeTag)
 
 use super::control::Control;
+use super::document::Document;
 
 /// 문단 (HWPTAG_PARA_HEADER + 하위 레코드)
 #[derive(Debug, Default, Clone)]
@@ -53,6 +54,8 @@ pub struct Paragraph {
     /// true: 모든 LineSeg의 vertical_pos=0이며 일부 cs>0으로 wrap zone이 이미 인코딩됨.
     /// → layout 엔진이 WrapAroundPara 흡수 없이 FullParagraph path로 렌더링해야 한다.
     pub wrap_precomputed: bool,
+    /// 문서 비교·동기화용 안정적 문단 식별자 (`sid:n{N}`). HWP 파일 포맷 필드는 아님.
+    pub stable_id: String,
 }
 
 /// 문단 번호 시작 방식
@@ -597,6 +600,7 @@ impl Paragraph {
             tab_extended: Vec::new(),
             numbering_restart: None,
             wrap_precomputed: false,
+            stable_id: String::new(),
         }
     }
 
@@ -948,6 +952,193 @@ impl Paragraph {
         }
 
         self.char_shapes = merged;
+    }
+}
+
+fn parse_stable_id_suffix(s: &str) -> Option<u64> {
+    let rest = s.strip_prefix("sid:n")?;
+    rest.parse::<u64>().ok()
+}
+
+/// 도큐먼트 트리를 순회하며 `stable_id`의 `sid:n` 접미 숫자 최댓값 다음 값을 반환한다.
+/// 기존 ID가 없으면 1을 반환한다.
+pub fn next_stable_serial_after_existing(doc: &Document) -> u64 {
+    let mut max_n = 0u64;
+    Paragraph::for_each_paragraph_ref(doc, &mut |p| {
+        if let Some(n) = parse_stable_id_suffix(&p.stable_id) {
+            max_n = max_n.max(n);
+        }
+    });
+    max_n.saturating_add(1).max(1)
+}
+
+impl Paragraph {
+    /// 문서 전역에 `sid:n1`부터 순서대로 `stable_id`를 부여한다(중첩 표·글상자·머리말 등 포함).
+    /// 반환값: 다음에 사용할 일련번호(미할당 첫 번호).
+    pub fn assign_stable_ids_for_document(doc: &mut Document) -> u64 {
+        let mut n = 1u64;
+        Self::walk_document_stable_ids(doc, false, &mut n);
+        n
+    }
+
+    /// `stable_id`가 비어 있는 문단만 채운다. `next`는 첫 미사용 일련번호이며, 종료 시 다음 미사용 값으로 갱신된다.
+    pub fn fill_empty_stable_ids_in_document(doc: &mut Document, next: &mut u64) {
+        Self::walk_document_stable_ids(doc, true, next);
+    }
+
+    /// `document`를 읽기 전용으로 순회하며 각 문단에 대해 `f`를 호출한다.
+    pub fn for_each_paragraph_ref(doc: &Document, f: &mut impl FnMut(&Paragraph)) {
+        for sec in &doc.sections {
+            for mp in &sec.section_def.master_pages {
+                for p in &mp.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            for p in &sec.paragraphs {
+                Self::walk_paragraph_ref(p, f);
+            }
+        }
+    }
+
+    fn walk_document_stable_ids(doc: &mut Document, only_empty: bool, next: &mut u64) {
+        for sec in &mut doc.sections {
+            for mp in &mut sec.section_def.master_pages {
+                for p in &mut mp.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            for p in &mut sec.paragraphs {
+                Self::walk_paragraph_stable_ids(p, only_empty, next);
+            }
+        }
+    }
+
+    pub(crate) fn walk_paragraph_stable_ids(p: &mut Paragraph, only_empty: bool, next: &mut u64) {
+        if only_empty {
+            if p.stable_id.is_empty() {
+                p.stable_id = format!("sid:n{}", *next);
+                *next = next.saturating_add(1);
+            }
+        } else {
+            p.stable_id = format!("sid:n{}", *next);
+            *next = next.saturating_add(1);
+        }
+        for ctrl in &mut p.controls {
+            Self::walk_control_stable_ids(ctrl, only_empty, next);
+        }
+    }
+
+    pub(crate) fn walk_paragraph_ref(p: &Paragraph, f: &mut impl FnMut(&Paragraph)) {
+        f(p);
+        for ctrl in &p.controls {
+            Self::walk_control_ref(ctrl, f);
+        }
+    }
+
+    fn walk_control_stable_ids(ctrl: &mut Control, only_empty: bool, next: &mut u64) {
+        match ctrl {
+            Control::Table(tbl) => {
+                if let Some(cap) = tbl.caption.as_mut() {
+                    for p in &mut cap.paragraphs {
+                        Self::walk_paragraph_stable_ids(p, only_empty, next);
+                    }
+                }
+                for cell in &mut tbl.cells {
+                    for p in &mut cell.paragraphs {
+                        Self::walk_paragraph_stable_ids(p, only_empty, next);
+                    }
+                }
+            }
+            Control::Shape(sh) => {
+                crate::model::shape::assign_stable_ids_in_shape(sh.as_mut(), only_empty, next);
+            }
+            Control::Picture(pic) => {
+                if let Some(cap) = pic.caption.as_mut() {
+                    for p in &mut cap.paragraphs {
+                        Self::walk_paragraph_stable_ids(p, only_empty, next);
+                    }
+                }
+            }
+            Control::Header(h) => {
+                for p in &mut h.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            Control::Footer(foot) => {
+                for p in &mut foot.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            Control::Footnote(f) => {
+                for p in &mut f.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            Control::Endnote(e) => {
+                for p in &mut e.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            Control::HiddenComment(h) => {
+                for p in &mut h.paragraphs {
+                    Self::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_control_ref(ctrl: &Control, f: &mut impl FnMut(&Paragraph)) {
+        match ctrl {
+            Control::Table(tbl) => {
+                if let Some(cap) = &tbl.caption {
+                    for p in &cap.paragraphs {
+                        Self::walk_paragraph_ref(p, f);
+                    }
+                }
+                for cell in &tbl.cells {
+                    for p in &cell.paragraphs {
+                        Self::walk_paragraph_ref(p, f);
+                    }
+                }
+            }
+            Control::Shape(sh) => {
+                crate::model::shape::for_each_paragraph_in_shape_ref(sh.as_ref(), f);
+            }
+            Control::Picture(pic) => {
+                if let Some(cap) = &pic.caption {
+                    for p in &cap.paragraphs {
+                        Self::walk_paragraph_ref(p, f);
+                    }
+                }
+            }
+            Control::Header(h) => {
+                for p in &h.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            Control::Footer(foot) => {
+                for p in &foot.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            Control::Footnote(fnote) => {
+                for p in &fnote.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            Control::Endnote(en) => {
+                for p in &en.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            Control::HiddenComment(h) => {
+                for p in &h.paragraphs {
+                    Self::walk_paragraph_ref(p, f);
+                }
+            }
+            _ => {}
+        }
     }
 }
 

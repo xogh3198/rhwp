@@ -65,8 +65,9 @@ impl DocumentCore {
 
         if has_controls {
             // 컨트롤 포함 문단은 merge 불가 → 직접 삽입
-            let right_half = self.document.sections[section_idx].paragraphs[para_idx]
+            let mut right_half = self.document.sections[section_idx].paragraphs[para_idx]
                 .split_at(char_offset);
+            self.ensure_paragraph_has_stable_id(&mut right_half);
 
             // 현재 문단 (왼쪽 반)이 비어있으면 첫 번째 파싱 문단으로 대체
             let left_empty = self.document.sections[section_idx].paragraphs[para_idx].text.is_empty();
@@ -105,6 +106,7 @@ impl DocumentCore {
                 merge_point = last.text.chars().count();
             }
 
+            self.ensure_paragraph_stable_ids_native();
             for i in para_idx..=last_para_idx {
                 self.reflow_paragraph(section_idx, i);
             }
@@ -124,16 +126,20 @@ impl DocumentCore {
         }
 
         // 다중 문단 삽입 (컨트롤 없는 텍스트만)
-        let right_half = self.document.sections[section_idx].paragraphs[para_idx]
+        let mut right_half = self.document.sections[section_idx].paragraphs[para_idx]
             .split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut right_half);
 
         self.document.sections[section_idx].paragraphs[para_idx]
             .merge_from(&parsed_paras[0]);
 
         let mut insert_idx = para_idx + 1;
         for i in 1..clip_count {
+            let mut p = parsed_paras[i].clone();
+            p.stable_id.clear();
+            self.ensure_paragraph_has_stable_id(&mut p);
             self.document.sections[section_idx].paragraphs
-                .insert(insert_idx, parsed_paras[i].clone());
+                .insert(insert_idx, p);
             insert_idx += 1;
         }
 
@@ -141,6 +147,7 @@ impl DocumentCore {
         let merge_point = self.document.sections[section_idx].paragraphs[last_para_idx]
             .merge_from(&right_half);
 
+        self.ensure_paragraph_stable_ids_native();
         for i in para_idx..=last_para_idx {
             self.reflow_paragraph(section_idx, i);
         }
@@ -268,19 +275,28 @@ impl DocumentCore {
         }
 
         // 다중 문단
-        let right_half = cell_paras[cell_para_idx].split_at(char_offset);
+        let mut next_serial = self.stable_id_serial;
+        let mut right_half = cell_paras[cell_para_idx].split_at(char_offset);
+        right_half.stable_id = format!("sid:n{}", next_serial);
+        next_serial = next_serial.saturating_add(1);
         cell_paras[cell_para_idx].merge_from(&parsed_paras[0]);
 
         let mut insert_idx = cell_para_idx + 1;
         for i in 1..clip_count {
-            cell_paras.insert(insert_idx, parsed_paras[i].clone());
+            let mut p = parsed_paras[i].clone();
+            p.stable_id.clear();
+            p.stable_id = format!("sid:n{}", next_serial);
+            next_serial = next_serial.saturating_add(1);
+            cell_paras.insert(insert_idx, p);
             insert_idx += 1;
         }
 
         let last_para_idx = insert_idx - 1;
         let merge_point = cell_paras[last_para_idx].merge_from(&right_half);
 
+        self.stable_id_serial = next_serial;
         let _ = cell_paras;
+        self.ensure_paragraph_stable_ids_native();
         for i in cell_para_idx..=last_para_idx {
             self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, i);
         }

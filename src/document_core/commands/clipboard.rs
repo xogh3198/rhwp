@@ -340,8 +340,9 @@ impl DocumentCore {
 
         // 다중 문단 또는 컨트롤 포함 붙여넣기
         // 1. 현재 문단을 캐럿 위치에서 분할
-        let right_half = self.document.sections[section_idx].paragraphs[para_idx]
+        let mut right_half = self.document.sections[section_idx].paragraphs[para_idx]
             .split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut right_half);
 
         // 2. 왼쪽 절반에 첫 번째 클립보드 문단 병합
         self.document.sections[section_idx].paragraphs[para_idx]
@@ -350,8 +351,11 @@ impl DocumentCore {
         // 3. 나머지 클립보드 문단 삽입
         let mut insert_idx = para_idx + 1;
         for i in 1..clip_count {
+            let mut p = clip_paras[i].clone();
+            p.stable_id.clear();
+            self.ensure_paragraph_has_stable_id(&mut p);
             self.document.sections[section_idx].paragraphs
-                .insert(insert_idx, clip_paras[i].clone());
+                .insert(insert_idx, p);
             insert_idx += 1;
         }
 
@@ -475,12 +479,19 @@ impl DocumentCore {
         }
 
         // 다중 문단 붙여넣기
-        let right_half = cell_paras[cell_para_idx].split_at(char_offset);
+        let mut next_serial = self.stable_id_serial;
+        let mut right_half = cell_paras[cell_para_idx].split_at(char_offset);
+        right_half.stable_id = format!("sid:n{}", next_serial);
+        next_serial = next_serial.saturating_add(1);
         cell_paras[cell_para_idx].merge_from(&clip_paras[0]);
 
         let mut insert_idx = cell_para_idx + 1;
         for i in 1..clip_count {
-            cell_paras.insert(insert_idx, clip_paras[i].clone());
+            let mut p = clip_paras[i].clone();
+            p.stable_id.clear();
+            p.stable_id = format!("sid:n{}", next_serial);
+            next_serial = next_serial.saturating_add(1);
+            cell_paras.insert(insert_idx, p);
             insert_idx += 1;
         }
 
@@ -488,6 +499,7 @@ impl DocumentCore {
         let merge_point = cell_paras[last_para_idx].merge_from(&right_half);
 
         // 셀 리플로우 (모든 영향받는 문단)
+        self.stable_id_serial = next_serial;
         let _ = cell_paras;
         for i in cell_para_idx..=last_para_idx {
             self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, cell_idx, i);
@@ -584,7 +596,7 @@ impl DocumentCore {
         char_offset: usize,
     ) -> Result<String, HwpError> {
         // 클립보드에서 컨트롤 문단 확인
-        let clip_para = match &self.clipboard {
+        let mut clip_para = match &self.clipboard {
             Some(c) => {
                 match c.paragraphs.first() {
                     Some(p) if !p.controls.is_empty() => p.clone(),
@@ -593,6 +605,7 @@ impl DocumentCore {
             }
             None => return Ok("{\"ok\":false,\"error\":\"clipboard empty\"}".to_string()),
         };
+        clip_para.stable_id.clear();
 
         // 인덱스 검증
         if section_idx >= self.document.sections.len() {
@@ -622,19 +635,30 @@ impl DocumentCore {
         if is_empty_para && char_offset == 0 {
             self.document.sections[section_idx].paragraphs[para_idx] = clip_para;
             insert_para_idx = para_idx;
+            let sid = self.allocate_stable_id();
+            self.document.sections[section_idx].paragraphs[insert_para_idx].stable_id = sid;
         } else if char_offset == 0 && para.controls.is_empty() {
             self.document.sections[section_idx].paragraphs.insert(para_idx, clip_para);
             insert_para_idx = para_idx;
+            let sid = self.allocate_stable_id();
+            self.document.sections[section_idx].paragraphs[insert_para_idx].stable_id = sid;
         } else {
             if char_offset > 0 && !para.text.is_empty() {
-                let new_para = self.document.sections[section_idx].paragraphs[para_idx]
-                    .split_at(char_offset);
+                let mut new_para = {
+                    let paras = &mut self.document.sections[section_idx].paragraphs;
+                    paras[para_idx].split_at(char_offset)
+                };
+                self.ensure_paragraph_has_stable_id(&mut new_para);
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, new_para);
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, clip_para);
                 insert_para_idx = para_idx + 1;
+                let sid = self.allocate_stable_id();
+                self.document.sections[section_idx].paragraphs[insert_para_idx].stable_id = sid;
             } else {
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, clip_para);
                 insert_para_idx = para_idx + 1;
+                let sid = self.allocate_stable_id();
+                self.document.sections[section_idx].paragraphs[insert_para_idx].stable_id = sid;
             }
         }
 

@@ -693,8 +693,9 @@ impl DocumentCore {
         self.document.sections[section_idx].raw_stream = None;
 
         // 문단 분리
-        let new_para = self.document.sections[section_idx].paragraphs[para_idx]
+        let mut new_para = self.document.sections[section_idx].paragraphs[para_idx]
             .split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut new_para);
 
         // 새 문단을 현재 문단 뒤에 삽입
         let new_para_idx = para_idx + 1;
@@ -754,8 +755,9 @@ impl DocumentCore {
         self.document.sections[section_idx].raw_stream = None;
 
         // 문단 분리
-        let new_para = self.document.sections[section_idx].paragraphs[para_idx]
+        let mut new_para = self.document.sections[section_idx].paragraphs[para_idx]
             .split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut new_para);
         let new_para_idx = para_idx + 1;
         self.document.sections[section_idx].paragraphs.insert(new_para_idx, new_para);
 
@@ -803,8 +805,9 @@ impl DocumentCore {
         self.document.sections[section_idx].raw_stream = None;
 
         // 문단 분리
-        let new_para = self.document.sections[section_idx].paragraphs[para_idx]
+        let mut new_para = self.document.sections[section_idx].paragraphs[para_idx]
             .split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut new_para);
         let new_para_idx = para_idx + 1;
         self.document.sections[section_idx].paragraphs.insert(new_para_idx, new_para);
 
@@ -1048,7 +1051,8 @@ impl DocumentCore {
 
         self.document.sections[section_idx].raw_stream = None;
 
-        let new_para = Paragraph::new_empty();
+        let mut new_para = Paragraph::new_empty();
+        self.ensure_paragraph_has_stable_id(&mut new_para);
         self.document.sections[section_idx].paragraphs.insert(para_idx, new_para);
 
         let reflow_target = if para_idx > 0 { para_idx - 1 } else { para_idx };
@@ -1095,7 +1099,8 @@ impl DocumentCore {
         let cell_para = self.get_cell_paragraph_mut(
             section_idx, parent_para_idx, control_idx, cell_idx, cell_para_idx,
         )?;
-        let new_para = cell_para.split_at(char_offset);
+        let mut new_para = cell_para.split_at(char_offset);
+        self.ensure_paragraph_has_stable_id(&mut new_para);
 
         // 새 문단을 셀/글상자에 삽입
         let new_cell_para_idx = cell_para_idx + 1;
@@ -1217,6 +1222,33 @@ impl DocumentCore {
             ))
         })?;
         Ok(section.paragraphs.len())
+    }
+
+    /// 본문 구역 문단의 `stable_id`를 반환한다 (네이티브).
+    pub fn get_paragraph_stable_id_native(
+        &self,
+        section_idx: usize,
+        para_idx: usize,
+    ) -> Result<String, HwpError> {
+        let section = self.document.sections.get(section_idx).ok_or_else(|| {
+            HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)", section_idx, self.document.sections.len()
+            ))
+        })?;
+        let para = section.paragraphs.get(para_idx).ok_or_else(|| {
+            HwpError::RenderError(format!(
+                "문단 인덱스 {} 범위 초과 (총 {}개)", para_idx, section.paragraphs.len()
+            ))
+        })?;
+        Ok(para.stable_id.clone())
+    }
+
+    /// `stable_id`가 비어 있는 문단만 문서 전역 순서로 채운다 (네이티브).
+    pub fn ensure_paragraph_stable_ids_native(&mut self) {
+        crate::model::paragraph::Paragraph::fill_empty_stable_ids_in_document(
+            &mut self.document,
+            &mut self.stable_id_serial,
+        );
     }
 
     /// 문단 글자 수 (네이티브)
@@ -2219,6 +2251,7 @@ impl DocumentCore {
         // 마지막 path 엔트리의 cell_para_idx가 분할 대상
         let last = path.last().unwrap();
         let cell_para_idx = last.2;
+        let mut next_serial = self.stable_id_serial;
 
         // 셀에 접근하여 문단 분할
         let section = self.document.sections.get_mut(section_idx)
@@ -2239,13 +2272,17 @@ impl DocumentCore {
                 if cell_para_idx >= cell.paragraphs.len() {
                     return Err(HwpError::RenderError("셀문단 범위 초과".to_string()));
                 }
-                let new_para = cell.paragraphs[cell_para_idx].split_at(char_offset);
+                let mut new_para = cell.paragraphs[cell_para_idx].split_at(char_offset);
+                new_para.stable_id = format!("sid:n{}", next_serial);
+                next_serial = next_serial.saturating_add(1);
                 cell.paragraphs.insert(cell_para_idx + 1, new_para);
                 break;
             }
             para = cell.paragraphs.get_mut(_cpi)
                 .ok_or_else(|| HwpError::RenderError("셀문단 범위 초과".to_string()))?;
         }
+
+        self.stable_id_serial = next_serial;
 
         let outer_ctrl = path[0].0;
         self.mark_cell_control_dirty(section_idx, parent_para_idx, outer_ctrl);

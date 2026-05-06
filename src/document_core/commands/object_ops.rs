@@ -747,8 +747,11 @@ impl DocumentCore {
         } else {
             // 문단 중간이면 분할 후 삽입
             if char_offset > 0 && !para.text.is_empty() {
-                let new_para = self.document.sections[section_idx].paragraphs[para_idx]
-                    .split_at(char_offset);
+                let mut new_para = {
+                    let paras = &mut self.document.sections[section_idx].paragraphs;
+                    paras[para_idx].split_at(char_offset)
+                };
+                self.ensure_paragraph_has_stable_id(&mut new_para);
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, new_para);
                 // 표 문단은 분할된 뒤에 삽입
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, table_para);
@@ -790,6 +793,8 @@ impl DocumentCore {
             ..Default::default()
         };
         self.document.sections[section_idx].paragraphs.insert(insert_para_idx + 1, empty_para);
+        let sid = self.allocate_stable_id();
+        self.document.sections[section_idx].paragraphs[insert_para_idx + 1].stable_id = sid;
 
         // --- 6. 스타일 갱신 + 리플로우 + 페이지네이션 ---
         // 새 BorderFill 추가 시 styles.border_styles 갱신이 필요하므로 rebuild_section 사용
@@ -1207,8 +1212,11 @@ impl DocumentCore {
             insert_para_idx = para_idx;
         } else {
             if char_offset > 0 && !para.text.is_empty() {
-                let new_para = self.document.sections[section_idx].paragraphs[para_idx]
-                    .split_at(char_offset);
+                let mut new_para = {
+                    let paras = &mut self.document.sections[section_idx].paragraphs;
+                    paras[para_idx].split_at(char_offset)
+                };
+                self.ensure_paragraph_has_stable_id(&mut new_para);
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, new_para);
                 self.document.sections[section_idx].paragraphs.insert(para_idx + 1, pic_para);
                 insert_para_idx = para_idx + 1;
@@ -1248,6 +1256,8 @@ impl DocumentCore {
             ..Default::default()
         };
         self.document.sections[section_idx].paragraphs.insert(insert_para_idx + 1, empty_para);
+        let sid = self.allocate_stable_id();
+        self.document.sections[section_idx].paragraphs[insert_para_idx + 1].stable_id = sid;
 
         // --- 5. 리플로우 + 페이지네이션 ---
         self.recompose_section(section_idx);

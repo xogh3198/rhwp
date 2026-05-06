@@ -314,7 +314,7 @@ impl DocumentCore {
             })?;
 
         // 문단 분할
-        let new_para = {
+        let mut new_para = {
             let ctrl = &mut self.document.sections[section_idx].paragraphs[pi].controls[ci];
             let paragraphs = match ctrl {
                 Control::Header(h) => &mut h.paragraphs,
@@ -328,6 +328,7 @@ impl DocumentCore {
             }
             paragraphs[hf_para_idx].split_at(char_offset)
         };
+        self.ensure_paragraph_has_stable_id(&mut new_para);
 
         // 새 문단 삽입
         let new_para_idx = hf_para_idx + 1;

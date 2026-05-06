@@ -1234,6 +1234,24 @@ impl HwpDocument {
             .map_err(|e| e.into())
     }
 
+    /// 본문 구역 문단의 안정적 식별자(`stable_id`)를 반환한다.
+    #[wasm_bindgen(js_name = getParagraphStableId)]
+    pub fn get_paragraph_stable_id(
+        &self,
+        section_idx: u32,
+        para_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.get_paragraph_stable_id_native(section_idx as usize, para_idx as usize)
+            .map_err(|e| e.into())
+    }
+
+    /// `stable_id`가 비어 있는 문단만 문서 순서로 채운다.
+    #[wasm_bindgen(js_name = ensureParagraphStableIds)]
+    pub fn ensure_paragraph_stable_ids(&mut self) -> Result<(), JsValue> {
+        self.ensure_paragraph_stable_ids_native();
+        Ok(())
+    }
+
     /// 문단에 텍스트박스가 있는 Shape 컨트롤이 있으면 해당 control_index를 반환한다.
     /// 없으면 -1을 반환한다.
     #[wasm_bindgen(js_name = getTextBoxControlIndex)]

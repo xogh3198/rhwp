@@ -110,6 +110,8 @@ pub struct DocumentCore {
     /// HWPX 비표준 감지 등 문서 검증 경고.
     /// `from_bytes` 에서 자동 생성되며, 사용자 고지·선택적 reflow 에 사용 (#177).
     pub(crate) validation_report: validation::ValidationReport,
+    /// 다음 `stable_id` 할당에 사용할 일련번호 (`sid:n{N}` 의 N).
+    pub(crate) stable_id_serial: u64,
 }
 
 /// 활성 필드 위치 정보
@@ -196,8 +198,11 @@ impl DocumentCore {
 
     /// 빈 문서를 생성한다 (테스트/미리보기용).
     pub fn new_empty() -> Self {
+        let mut document = Document::default();
+        let stable_id_serial =
+            crate::model::paragraph::Paragraph::assign_stable_ids_for_document(&mut document);
         DocumentCore {
-            document: Document::default(),
+            document,
             pagination: Vec::new(),
             styles: ResolvedStyleSet::default(),
             composed: Vec::new(),
@@ -228,6 +233,21 @@ impl DocumentCore {
             para_offset: Vec::new(),
             source_format: crate::parser::FileFormat::Hwp,
             validation_report: validation::ValidationReport::new(),
+            stable_id_serial,
+        }
+    }
+
+    /// 새 문단 등에 부여할 `stable_id`를 생성하고 시리얼을 증가시킨다.
+    pub(crate) fn allocate_stable_id(&mut self) -> String {
+        let id = format!("sid:n{}", self.stable_id_serial);
+        self.stable_id_serial = self.stable_id_serial.saturating_add(1);
+        id
+    }
+
+    /// `stable_id`가 비어 있으면 새 ID를 부여한다.
+    pub(crate) fn ensure_paragraph_has_stable_id(&mut self, p: &mut Paragraph) {
+        if p.stable_id.is_empty() {
+            p.stable_id = self.allocate_stable_id();
         }
     }
 

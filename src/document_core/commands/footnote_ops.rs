@@ -204,7 +204,7 @@ impl DocumentCore {
         char_offset: usize,
     ) -> Result<String, HwpError> {
         // 문단 분할
-        let new_para = {
+        let mut new_para = {
             let section = self.document.sections.get_mut(section_idx)
                 .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?;
             let para = section.paragraphs.get_mut(para_idx)
@@ -223,6 +223,7 @@ impl DocumentCore {
                 _ => return Err(HwpError::RenderError("컨트롤이 각주가 아닙니다".to_string())),
             }
         };
+        self.ensure_paragraph_has_stable_id(&mut new_para);
 
         // 새 문단 삽입
         let new_para_idx = fn_para_idx + 1;

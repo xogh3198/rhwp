@@ -731,6 +731,112 @@ pub struct OleShape {
     pub caption: Option<Caption>,
 }
 
+fn walk_drawing_stable_ids(d: &mut DrawingObjAttr, only_empty: bool, next: &mut u64) {
+    if let Some(tb) = d.text_box.as_mut() {
+        for p in &mut tb.paragraphs {
+            Paragraph::walk_paragraph_stable_ids(p, only_empty, next);
+        }
+    }
+}
+
+fn walk_drawing_paragraphs_ref(d: &DrawingObjAttr, f: &mut impl FnMut(&Paragraph)) {
+    if let Some(tb) = &d.text_box {
+        for p in &tb.paragraphs {
+            Paragraph::walk_paragraph_ref(p, f);
+        }
+    }
+}
+
+/// 그리기 개체 트리(글상자·그룹·캡션)에 `stable_id`를 부여하거나 빈 값만 채운다.
+pub fn assign_stable_ids_in_shape(shape: &mut ShapeObject, only_empty: bool, next: &mut u64) {
+    match shape {
+        ShapeObject::Group(g) => {
+            if let Some(cap) = g.caption.as_mut() {
+                for p in &mut cap.paragraphs {
+                    Paragraph::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+            for ch in &mut g.children {
+                assign_stable_ids_in_shape(ch, only_empty, next);
+            }
+        }
+        ShapeObject::Picture(p) => {
+            if let Some(cap) = p.caption.as_mut() {
+                for p in &mut cap.paragraphs {
+                    Paragraph::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+        }
+        ShapeObject::Line(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Rectangle(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Ellipse(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Arc(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Polygon(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Curve(s) => walk_drawing_stable_ids(&mut s.drawing, only_empty, next),
+        ShapeObject::Chart(c) => {
+            walk_drawing_stable_ids(&mut c.drawing, only_empty, next);
+            if let Some(cap) = c.caption.as_mut() {
+                for p in &mut cap.paragraphs {
+                    Paragraph::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+        }
+        ShapeObject::Ole(o) => {
+            walk_drawing_stable_ids(&mut o.drawing, only_empty, next);
+            if let Some(cap) = o.caption.as_mut() {
+                for p in &mut cap.paragraphs {
+                    Paragraph::walk_paragraph_stable_ids(p, only_empty, next);
+                }
+            }
+        }
+    }
+}
+
+/// 그리기 개체 트리 안의 모든 문단에 대해 읽기 전용 순회한다.
+pub fn for_each_paragraph_in_shape_ref(shape: &ShapeObject, f: &mut impl FnMut(&Paragraph)) {
+    match shape {
+        ShapeObject::Group(g) => {
+            if let Some(cap) = &g.caption {
+                for p in &cap.paragraphs {
+                    Paragraph::walk_paragraph_ref(p, f);
+                }
+            }
+            for ch in &g.children {
+                for_each_paragraph_in_shape_ref(ch, f);
+            }
+        }
+        ShapeObject::Picture(p) => {
+            if let Some(cap) = &p.caption {
+                for p in &cap.paragraphs {
+                    Paragraph::walk_paragraph_ref(p, f);
+                }
+            }
+        }
+        ShapeObject::Line(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Rectangle(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Ellipse(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Arc(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Polygon(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Curve(s) => walk_drawing_paragraphs_ref(&s.drawing, f),
+        ShapeObject::Chart(c) => {
+            walk_drawing_paragraphs_ref(&c.drawing, f);
+            if let Some(cap) = &c.caption {
+                for p in &cap.paragraphs {
+                    Paragraph::walk_paragraph_ref(p, f);
+                }
+            }
+        }
+        ShapeObject::Ole(o) => {
+            walk_drawing_paragraphs_ref(&o.drawing, f);
+            if let Some(cap) = &o.caption {
+                for p in &cap.paragraphs {
+                    Paragraph::walk_paragraph_ref(p, f);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

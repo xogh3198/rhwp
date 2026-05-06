@@ -546,6 +546,37 @@ impl Paginator {
         (hf_entries, page_number_pos, page_hides, new_page_numbers)
     }
 
+    /// 비-TAC 그림이 column `used_height`에 높이를 예약해야 하는지.
+    ///
+    /// [PR #571 분리 — 시각 게이트 대상] 한컴 정합을 위해 예약 규칙을 세분화한다.
+    /// - `Square`(어울림)·`InFront`·`Behind`: 본문 흐름 높이를 소비하지 않는다 (layout 어울림·부유와 동일 계열).
+    /// - `TopAndBottom` + `vert_rel_to == Paper`: 머리말 밴드(`header_area`) 안에서는 예약 생략.
+    fn should_reserve_picture_height(
+        &self,
+        common: &crate::model::shape::CommonObjAttr,
+        st: &PaginationState,
+    ) -> bool {
+        use crate::model::shape::{TextWrap, VertRelTo};
+        if common.treat_as_char {
+            return false;
+        }
+        match common.text_wrap {
+            TextWrap::InFrontOfText | TextWrap::BehindText => false,
+            TextWrap::Square => false,
+            TextWrap::TopAndBottom => {
+                if common.vert_rel_to == VertRelTo::Paper {
+                    let header_band = st.layout.header_area.height;
+                    let y = st.current_zone_y_offset + st.current_height;
+                    if y < header_band - 0.5 {
+                        return false;
+                    }
+                }
+                true
+            }
+            TextWrap::Tight | TextWrap::Through => false,
+        }
+    }
+
     /// 다단 나누기 처리
     fn process_multicolumn_break(
         &self,
@@ -1068,12 +1099,8 @@ impl Paginator {
                         para_index: para_idx,
                         control_index: ctrl_idx,
                     });
-                    // 비-TAC 그림: 본문 공간을 차지하는 배치이면 높이 추가 (Task #10)
-                    if !pic.common.treat_as_char
-                        && matches!(pic.common.text_wrap,
-                            crate::model::shape::TextWrap::Square
-                            | crate::model::shape::TextWrap::TopAndBottom)
-                    {
+                    // 비-TAC 그림: 자리차지·본문 밀림 등에만 used_height 예약 (`should_reserve_picture_height`).
+                    if self.should_reserve_picture_height(&pic.common, st) {
                         let pic_h = crate::renderer::hwpunit_to_px(pic.common.height as i32, self.dpi);
                         let margin_top = crate::renderer::hwpunit_to_px(pic.common.margin.top as i32, self.dpi);
                         let margin_bottom = crate::renderer::hwpunit_to_px(pic.common.margin.bottom as i32, self.dpi);

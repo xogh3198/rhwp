@@ -9,7 +9,7 @@
 //! MS Word/OOXML의 cantSplit/tblHeader를 참고.
 
 use crate::model::control::Control;
-use crate::model::shape::CaptionDirection;
+use crate::model::shape::{CaptionDirection, ShapeObject, TextWrap};
 use crate::model::header_footer::HeaderFooterApply;
 use crate::model::paragraph::{Paragraph, ColumnBreakType};
 use crate::model::page::{PageDef, ColumnDef};
@@ -597,6 +597,7 @@ impl TypesetEngine {
             if !has_table {
                 // --- 핵심: format → fits → place/split ---
                 let formatted = self.format_paragraph(para, composed.get(para_idx), styles);
+                let formatted = self.normalize_floating_only_paragraph_height(para, formatted);
                 self.typeset_paragraph(&mut st, para_idx, para, &formatted);
             } else {
                 // 표 문단: Phase 2에서 전환 예정. 현재는 기존 방식 호환용 stub.
@@ -848,6 +849,56 @@ impl TypesetEngine {
             spacing_after,
             height_for_fit,
         }
+    }
+
+    /// 텍스트가 비어 있고 비-TAC **부유**(글 앞/글 뒤) 그림만 있는 문단의 조판 높이를 0으로 맞춘다.
+    ///
+    /// [PR #571 분리 — 시각 게이트 대상] Square·표·TAC 개체가 섞이면 적용하지 않는다.
+    fn normalize_floating_only_paragraph_height(
+        &self,
+        para: &Paragraph,
+        mut fmt: FormattedParagraph,
+    ) -> FormattedParagraph {
+        let trimmed = para.text.replace(|c: char| c.is_control(), "");
+        if !trimmed.trim().is_empty() || para.controls.is_empty() {
+            return fmt;
+        }
+        let only_float_pictures = para.controls.iter().all(|c| match c {
+            Control::Picture(p) => {
+                !p.common.treat_as_char
+                    && matches!(
+                        p.common.text_wrap,
+                        TextWrap::InFrontOfText | TextWrap::BehindText,
+                    )
+            }
+            Control::Shape(s) => {
+                if s.common().treat_as_char {
+                    return false;
+                }
+                matches!(
+                    s.as_ref(),
+                    ShapeObject::Picture(p) if matches!(
+                        p.common.text_wrap,
+                        TextWrap::InFrontOfText | TextWrap::BehindText,
+                    ),
+                )
+            }
+            _ => false,
+        });
+        if !only_float_pictures {
+            return fmt;
+        }
+        fmt.total_height = 0.0;
+        fmt.height_for_fit = 0.0;
+        fmt.spacing_before = 0.0;
+        fmt.spacing_after = 0.0;
+        for h in &mut fmt.line_heights {
+            *h = 0.0;
+        }
+        for s in &mut fmt.line_spacings {
+            *s = 0.0;
+        }
+        fmt
     }
 
     // ========================================================

@@ -1,4 +1,5 @@
 import type { CommandServices } from '@/command/types';
+import { formatDiffLocationCombined } from '@/compare/diff-location-label';
 import { compareDocuments } from '@/compare/diff-engine';
 import type { CompareSessionStore } from '@/compare/session';
 import type { CompareOptions, DiffItem, DiffKind } from '@/compare/types';
@@ -154,18 +155,21 @@ export class CompareDialog {
     actions.append(this.runBtn, this.openTwoPaneBtn);
     body.appendChild(actions);
 
+    const resultsWrap = document.createElement('div');
+    resultsWrap.className = 'compare-results';
+
     const resultTitle = document.createElement('div');
     resultTitle.className = 'compare-kinds-title';
     resultTitle.textContent = '비교 결과';
-    body.appendChild(resultTitle);
 
     this.resultMetaEl = document.createElement('span');
     this.resultMetaEl.className = 'compare-result-meta';
     this.resultMetaEl.textContent = '비교 실행 전';
     this.resultListEl = document.createElement('ul');
     this.resultListEl.className = 'compare-result-list';
-    body.appendChild(this.resultMetaEl);
-    body.appendChild(this.resultListEl);
+
+    resultsWrap.append(resultTitle, this.resultMetaEl, this.resultListEl);
+    body.appendChild(resultsWrap);
 
     this.wrap.appendChild(body);
     this.prefillRightFromCurrentDocument();
@@ -300,7 +304,7 @@ export class CompareDialog {
       setTimeout(() => {
         off();
         reject(new Error('오른쪽 문서 로드 타임아웃'));
-      }, 15000);
+      }, 90_000);
     });
     this.services.eventBus.emit('open-document-bytes', {
       bytes: new Uint8Array(file.bytes),
@@ -317,7 +321,7 @@ export class CompareDialog {
       const li = document.createElement('li');
       li.className = 'compare-result-item';
       li.dataset.diffId = item.id;
-      const location = this.formatLocation(item);
+      const location = formatDiffLocationCombined(item);
       const valueDiff = this.renderValueDiff(item);
       const leftPreview = this.formatPreviewText(this.sanitizeControlPreview(item.leftPreview));
       const rightPreview = this.formatPreviewText(this.sanitizeControlPreview(item.rightPreview));
@@ -345,19 +349,6 @@ export class CompareDialog {
       });
       this.resultListEl.appendChild(li);
     }
-  }
-
-  private formatLocation(item: DiffItem): string | null {
-    const sec = item.path.section;
-    if (sec < 0) return null;
-    const sectionPage =
-      item.severity === 'removed'
-        ? item.leftSectionPage
-        : (item.rightSectionPage ?? item.leftSectionPage);
-    if (sectionPage && sectionPage > 0) return `제 ${sec + 1}구역, ${sectionPage}쪽`;
-    const anchor = item.severity === 'removed' ? item.leftAnchor : (item.rightAnchor ?? item.leftAnchor);
-    if (!anchor) return `제 ${sec + 1}구역`;
-    return `제 ${sec + 1}구역, ${anchor.pageIndex + 1}쪽`;
   }
 
   private formatPreviewText(text: string): string {

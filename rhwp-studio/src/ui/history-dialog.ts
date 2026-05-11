@@ -25,6 +25,7 @@
  * - 위치 표기는 `leftSectionPage/rightSectionPage` 우선, 없으면 anchor.pageIndex 폴백 순서 유지.
  */
 import type { CommandServices } from '@/command/types';
+import { formatDiffLocationCombined } from '@/compare/diff-location-label';
 import { buildSnapshotFromWasm, compareDocuments, compareSnapshots } from '@/compare/diff-engine';
 import type { CompareSessionStore } from '@/compare/session';
 import type { CompareOptions, DiffItem, DiffKind } from '@/compare/types';
@@ -272,7 +273,7 @@ export class HistoryDialog {
       const li = document.createElement('li');
       li.className = 'compare-result-item';
       li.dataset.diffId = item.id;
-      const location = this.formatLocation(item);
+      const location = formatDiffLocationCombined(item);
       const leftText = this.formatPreviewText(this.sanitizeControlPreview(item.leftPreview));
       const rightText = this.formatPreviewText(this.sanitizeControlPreview(item.rightPreview));
       const previewLine = (item.kind === 'text' || item.severity !== 'modified')
@@ -516,19 +517,6 @@ export class HistoryDialog {
       if ((lh.get(key) ?? '') !== (rh.get(key) ?? '')) changed += 1;
     }
     return changed;
-  }
-
-  private formatLocation(item: DiffItem): string | null {
-    const sec = item.path.section;
-    if (sec < 0) return null;
-    const sectionPage =
-      item.severity === 'removed'
-        ? item.leftSectionPage
-        : (item.rightSectionPage ?? item.leftSectionPage);
-    if (sectionPage && sectionPage > 0) return `제 ${sec + 1}구역, ${sectionPage}쪽`;
-    const anchor = item.severity === 'removed' ? item.leftAnchor : (item.rightAnchor ?? item.leftAnchor);
-    if (!anchor) return `제 ${sec + 1}구역`;
-    return `제 ${sec + 1}구역, ${anchor.pageIndex + 1}쪽`;
   }
 
   private kindLabel(kind: DiffItem['kind']): string {

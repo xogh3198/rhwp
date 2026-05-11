@@ -2225,6 +2225,26 @@ type ParagraphAlignStep =
   | { kind: 'l'; l: CompareParaSnapshot }
   | { kind: 'r'; r: CompareParaSnapshot };
 
+/** 정렬 스트림에서 직전에 등장한 왼쪽 문단(짝 맞춤 기준) — 오른쪽 전용 추가 항목의 왼쪽 패널 프리뷰용 */
+function nearestAlignedLeftPeer(steps: ParagraphAlignStep[], fromIndex: number): CompareParaSnapshot | null {
+  for (let j = fromIndex - 1; j >= 0; j--) {
+    const s = steps[j];
+    if (s.kind === 'lr') return s.l;
+    if (s.kind === 'l') return s.l;
+  }
+  return null;
+}
+
+/** 정렬 스트림에서 직전에 등장한 오른쪽 문단 — 왼쪽 전용 삭제 항목의 오른쪽 패널 프리뷰용 */
+function nearestAlignedRightPeer(steps: ParagraphAlignStep[], fromIndex: number): CompareParaSnapshot | null {
+  for (let j = fromIndex - 1; j >= 0; j--) {
+    const s = steps[j];
+    if (s.kind === 'lr') return s.r;
+    if (s.kind === 'r') return s.r;
+  }
+  return null;
+}
+
 function buildParagraphAlignStepsFromAligned(aligned: AlignedPair[]): ParagraphAlignStep[] {
   const steps: ParagraphAlignStep[] = [];
   for (const pair of aligned) {
@@ -2351,6 +2371,7 @@ function cleanupParagraphAlignStepsToDiffItems(
                 rightPreview: rTail.text,
                 rightAnchor: rTail.anchor,
                 rightSectionPage: rTail.sectionPage,
+                contextOnLeft: { section: L.section, paragraph: L.paragraph },
               },
             ]),
       );
@@ -2361,6 +2382,7 @@ function cleanupParagraphAlignStepsToDiffItems(
     if (s0.kind === 'r') {
       const r = s0.r;
       if (!shouldSuppressNoiseParagraphOnly(r)) {
+        const ctxL = nearestAlignedLeftPeer(steps, i);
         diffs.push({
           id: mkDiffId('text', `added:${r.section}:${r.paragraph}`),
           kind: 'text',
@@ -2371,6 +2393,7 @@ function cleanupParagraphAlignStepsToDiffItems(
           rightPreview: r.text,
           rightAnchor: r.anchor,
           rightSectionPage: r.sectionPage,
+          ...(ctxL ? { contextOnLeft: { section: ctxL.section, paragraph: ctxL.paragraph } } : {}),
         });
       }
       i += 1;
@@ -2379,6 +2402,7 @@ function cleanupParagraphAlignStepsToDiffItems(
     if (s0.kind === 'l') {
       const l = s0.l;
       if (!shouldSuppressNoiseParagraphOnly(l)) {
+        const ctxR = nearestAlignedRightPeer(steps, i);
         diffs.push({
           id: mkDiffId('text', `removed:${l.section}:${l.paragraph}`),
           kind: 'text',
@@ -2389,6 +2413,7 @@ function cleanupParagraphAlignStepsToDiffItems(
           rightPreview: '',
           leftAnchor: l.anchor,
           leftSectionPage: l.sectionPage,
+          ...(ctxR ? { contextOnRight: { section: ctxR.section, paragraph: ctxR.paragraph } } : {}),
         });
       }
       i += 1;
@@ -2917,8 +2942,25 @@ function annotateDiffSectionPages(
       }
     }
 
+    if (!lp && d.contextOnLeft) {
+      lp = lByPos.get(`${d.contextOnLeft.section}:${d.contextOnLeft.paragraph}`);
+    }
+    if (!rp && d.contextOnRight) {
+      rp = rByPos.get(`${d.contextOnRight.section}:${d.contextOnRight.paragraph}`);
+    }
+
     if (lp) d.leftSectionPage = lp.sectionPage;
     if (rp) d.rightSectionPage = rp.sectionPage;
+
+    // context 짝 문단이 잡혔는데 구역 쪽번호가 비어 있으면(특정 조판에서 생략) 앵커 기준 표시쪽으로 보강한다.
+    if (!d.leftSectionPage && lp?.anchor?.pageIndex !== undefined && left.meta.pageDisplayNumbers) {
+      const pn = left.meta.pageDisplayNumbers[lp.anchor.pageIndex];
+      if (pn && pn > 0) d.leftSectionPage = pn;
+    }
+    if (!d.rightSectionPage && rp?.anchor?.pageIndex !== undefined && right.meta.pageDisplayNumbers) {
+      const pn = right.meta.pageDisplayNumbers[rp.anchor.pageIndex];
+      if (pn && pn > 0) d.rightSectionPage = pn;
+    }
 
     // 문단 매핑 실패(특히 컨트롤/일부 메타) 시에도 렌더 엔진이 계산한 표시 쪽번호를 사용.
     if (!d.leftSectionPage && d.leftAnchor) {

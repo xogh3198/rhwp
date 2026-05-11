@@ -99,6 +99,12 @@ export interface DiffItem {
   rightPreview: string;
   leftAnchor?: DiffAnchor;
   rightAnchor?: DiffAnchor;
+  /**
+   * alignment 기준 반대쪽 문단 — 한쪽만 앵커가 있어도 **각 문서의 레이아웃**으로 페이지를 연다.
+   * 예: 오른쪽 '문단 추가'면 왼쪽 패널은 삽입 직전에 짝을 맞춘 왼쪽 문단(`getCursorRect`) 기준.
+   */
+  contextOnLeft?: { section: number; paragraph: number };
+  contextOnRight?: { section: number; paragraph: number };
   /** 좌/우 문서 기준 구역 내 쪽 번호 (1-base) */
   leftSectionPage?: number;
   rightSectionPage?: number;

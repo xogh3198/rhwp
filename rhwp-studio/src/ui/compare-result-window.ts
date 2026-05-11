@@ -1,5 +1,6 @@
+import { formatDiffLocationCombined, formatParagraphLocationForSide, isComparePreviewAbsent } from '@/compare/diff-location-label';
 import type { CompareSessionStore } from '@/compare/session';
-import type { CompareSession, DiffItem } from '@/compare/types';
+import type { CompareSession, DiffAnchor, DiffItem } from '@/compare/types';
 import { WasmBridge } from '@/core/wasm-bridge';
 
 type CompareSourceDocument = {
@@ -56,8 +57,8 @@ export class CompareResultWindow {
       document.body.appendChild(this.wrap);
     }
     this.titleEl.textContent = `문서 비교 상세 · ${session.left.name} ↔ ${session.right.name}`;
-    this.leftTitleEl.textContent = '왼쪽 문서';
-    this.rightTitleEl.textContent = '오른쪽 문서';
+    this.leftTitleEl.textContent = `왼쪽 문서: ${session.left.name}`;
+    this.rightTitleEl.textContent = `오른쪽 문서: ${session.right.name}`;
     void this.focusDiff(initialIndex);
   }
 
@@ -85,7 +86,10 @@ export class CompareResultWindow {
     const item = this.session.diffItems[index];
     if (!item) return;
     await this.ensureCompareDocumentsLoaded();
-    this.metaEl.textContent = `[${item.kind}] ${item.title}`;
+    const locCombined = formatDiffLocationCombined(item);
+    this.metaEl.textContent = locCombined
+      ? `[${item.kind}] ${item.title}\n${locCombined}`
+      : `[${item.kind}] ${item.title}`;
     this.leftPane.innerHTML = this.highlightPreview(item, 'left');
     this.rightPane.innerHTML = this.highlightPreview(item, 'right');
     this.renderRealDocumentPreview(item);
@@ -174,22 +178,6 @@ export class CompareResultWindow {
     this.wrap.append(head, body);
   }
 
-  /**
-   * 한쪽 문서 기준 구역·쪽(`annotateDiffSectionPages`가 채운 구역 내 쪽번호 우선, 없으면 앵커 글로벌 쪽).
-   */
-  private formatDiffLocationForSide(item: DiffItem, side: 'left' | 'right'): string | null {
-    const sec = item.path.section;
-    if (sec < 0) return null;
-    if (side === 'left' && item.severity === 'added') return null;
-    if (side === 'right' && item.severity === 'removed') return null;
-
-    const sectionPage = side === 'left' ? item.leftSectionPage : item.rightSectionPage;
-    if (sectionPage && sectionPage > 0) return `제 ${sec + 1}구역, ${sectionPage}쪽`;
-    const anchor = side === 'left' ? item.leftAnchor : item.rightAnchor;
-    if (anchor) return `제 ${sec + 1}구역, ${anchor.pageIndex + 1}쪽`;
-    return `제 ${sec + 1}구역`;
-  }
-
   private highlightPreview(item: DiffItem, side: 'left' | 'right'): string {
     const severity = item.severity;
     let leftText: string;
@@ -210,7 +198,11 @@ export class CompareResultWindow {
       leftText = this.formatInspectorText(item.leftPreview || '(없음)');
       rightText = this.formatInspectorText(item.rightPreview || '(없음)');
     }
+    const raw = side === 'left' ? item.leftPreview : item.rightPreview;
     const text = side === 'left' ? leftText : rightText;
+    if (isComparePreviewAbsent(raw)) {
+      return `<pre>${this.escape(text)}</pre>`;
+    }
     if (severity === 'added' && side === 'right') {
       return `<pre><mark>${this.escape(text)}</mark></pre>`;
     }
@@ -429,6 +421,38 @@ export class CompareResultWindow {
     this.renderSidePage('right', this.rightWasm, this.rightCanvas, this.rightMarker, this.rightStatusEl, item);
   }
 
+  /**
+   * 스냅샷 비교 때 기록된 앵커가 한쪽만 있으면(**추가/삭제**) 반대 문서 패널에서는
+   * 상대쪽 pageIndex를 쓰면 안 된다(pagination 불일치). alignment 짝 문단 경로가 있으면
+   * `getCursorRect`로 해당 **문서** 기준 페이지·좌표를 구한다.
+   */
+  private resolveRenderAnchor(
+    wasm: WasmBridge,
+    item: DiffItem,
+    side: 'left' | 'right',
+  ): { anchor: DiffAnchor; fromDiffEngine: boolean } | null {
+    const snapshot = side === 'left' ? item.leftAnchor : item.rightAnchor;
+    if (snapshot && typeof snapshot.pageIndex === 'number') {
+      return { anchor: snapshot, fromDiffEngine: true };
+    }
+    const peerPath = side === 'left' ? item.contextOnLeft : item.contextOnRight;
+    if (!peerPath) return null;
+    try {
+      const rect = wasm.getCursorRect(peerPath.section, peerPath.paragraph, 0);
+      const h = Math.max(14, rect.height);
+      const anchor = {
+        pageIndex: rect.pageIndex,
+        x: rect.x,
+        y: rect.y,
+        width: Math.max(28, Math.min(520, h * 3)),
+        height: h,
+      };
+      return { anchor, fromDiffEngine: false };
+    } catch {
+      return null;
+    }
+  }
+
   private renderSidePage(
     side: 'left' | 'right',
     wasm: WasmBridge | null,
@@ -437,49 +461,51 @@ export class CompareResultWindow {
     statusEl: HTMLDivElement,
     item: DiffItem,
   ): void {
-    const anchor = side === 'left' ? item.leftAnchor : item.rightAnchor;
-    const oppositeAnchor = side === 'left' ? item.rightAnchor : item.leftAnchor;
     if (!wasm) {
       statusEl.textContent = '문서가 아직 로드되지 않았습니다.';
       marker.style.display = 'none';
       return;
     }
-    const effectiveAnchor = anchor ?? oppositeAnchor;
-    if (!effectiveAnchor) {
-      const locShort = this.formatDiffLocationForSide(item, side);
-      const base = side === 'left' ? '왼쪽 문서에 해당 위치가 없습니다.' : '오른쪽 문서에 해당 위치가 없습니다.';
+    const resolved = this.resolveRenderAnchor(wasm, item, side);
+    if (!resolved) {
+      const locShort = formatParagraphLocationForSide(item, side);
+      const base =
+        side === 'left'
+          ? '왼쪽: 스냅샷 직후 위치 정보가 없습니다. (텍스트 미리보기만 참고)'
+          : '오른쪽: 스냅샷 직후 위치 정보가 없습니다. (텍스트 미리보기만 참고)';
       statusEl.textContent = locShort ? `${locShort} · ${base}` : base;
       const ctx = canvas.getContext('2d');
       if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
       marker.style.display = 'none';
       return;
     }
+
+    const { anchor: ea, fromDiffEngine } = resolved;
     try {
-      const info = wasm.getPageInfo(effectiveAnchor.pageIndex);
+      const info = wasm.getPageInfo(ea.pageIndex);
       const wrap = side === 'left' ? this.leftCanvasWrap : this.rightCanvasWrap;
       const maxWidth = Math.max(260, wrap.clientWidth - 10);
       const scale = Math.max(0.25, Math.min(1.25, maxWidth / Math.max(1, info.width)));
-      const pageIdx = effectiveAnchor.pageIndex;
+      const pageIdx = ea.pageIndex;
       const draw = (): void => {
         try {
           canvas.width = Math.max(1, Math.floor(info.width * scale));
           canvas.height = Math.max(1, Math.floor(info.height * scale));
-          // 본 편집기는 flow+overlay 분리이나, 비교 상세는 단일 캔버스이므로 전 레이어('all')로 통일
           wasm.renderPageToCanvasFiltered(pageIdx, canvas, scale, 'all');
-          const locShort = this.formatDiffLocationForSide(item, side);
-          const pageLine = anchor
-            ? `${effectiveAnchor.pageIndex + 1}쪽 실제 화면`
-            : `${effectiveAnchor.pageIndex + 1}쪽 대응 페이지(반대 문서 기준)`;
-          if (anchor) {
+          const locShort = formatParagraphLocationForSide(item, side);
+          const pageLine = `${ea.pageIndex + 1}쪽`;
+          const contextNote = !fromDiffEngine ? ' · 직전 정렬 짝 문단 기준(마커 없음)' : '';
+          if (fromDiffEngine) {
             marker.style.display = 'block';
-            marker.style.left = `${Math.max(0, Math.floor(anchor.x * scale))}px`;
-            marker.style.top = `${Math.max(0, Math.floor(anchor.y * scale))}px`;
-            marker.style.width = `${Math.max(14, Math.floor(anchor.width * scale))}px`;
-            marker.style.height = `${Math.max(14, Math.floor(anchor.height * scale))}px`;
+            marker.style.left = `${Math.max(0, Math.floor(ea.x * scale))}px`;
+            marker.style.top = `${Math.max(0, Math.floor(ea.y * scale))}px`;
+            marker.style.width = `${Math.max(14, Math.floor(ea.width * scale))}px`;
+            marker.style.height = `${Math.max(14, Math.floor(ea.height * scale))}px`;
           } else {
             marker.style.display = 'none';
           }
-          statusEl.textContent = locShort ? `${locShort} · ${pageLine}` : pageLine;
+          statusEl.textContent = `${locShort ? `${locShort} · ` : ''}${pageLine} 실제 화면${contextNote}`;
+          wrap.scrollTop = Math.max(0, marker.offsetTop - Math.floor(wrap.clientHeight * 0.15));
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           statusEl.textContent = `페이지 렌더 실패: ${msg}`;
